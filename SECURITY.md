@@ -17,6 +17,8 @@ Security fixes land on the latest minor release. There is no LTS branch.
 
 ## Threat model
 
+For the full threat model — including adversary scenarios, design rationale, and residual risks — see [THREAT_MODEL.md](THREAT_MODEL.md). The summary below is a quick reference.
+
 `hermes-mcp` exposes Hermes Agent — a tool-calling LLM with shell, filesystem, browser, email, and scheduling capabilities — to remote clients (Claude Desktop, Claude mobile) over HTTPS. Compromise of the bearer token or the host machine is equivalent to **remote action execution on the mini-PC** at the privileges of the user running `hermes-mcp`.
 
 ### Trust boundaries
