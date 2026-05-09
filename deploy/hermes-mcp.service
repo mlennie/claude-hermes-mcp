@@ -1,0 +1,20 @@
+[Unit]
+Description=Hermes MCP Bridge
+Documentation=https://github.com/REPLACE_ME/hermes-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clawone
+# Create /etc/hermes-mcp.env (mode 0600) with your env vars — see .env.example
+EnvironmentFile=/etc/hermes-mcp.env
+ExecStart=/home/clawone/.local/bin/hermes-mcp serve
+Restart=on-failure
+RestartSec=5
+# Prevent the process from writing to /tmp or gaining new privileges
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=ngrok tunnel for hermes-mcp (alternative to cloudflared)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clawone
+# Set NGROK_AUTHTOKEN in environment or use `ngrok config add-authtoken` first
+ExecStart=/usr/local/bin/ngrok http 8765 --domain=your-name.ngrok-free.app --log=stdout
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

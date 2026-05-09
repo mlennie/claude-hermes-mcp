@@ -1,0 +1,93 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-mcp"
+version = "0.1.0"
+description = "MCP bridge that lets Claude Desktop / Claude mobile delegate tasks to a local Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "hermes-mcp contributors" }]
+keywords = [
+    "mcp",
+    "mcp-server",
+    "claude",
+    "claude-mcp",
+    "hermes",
+    "model-context-protocol",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "mcp>=1.2.0",
+    "starlette>=0.37",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+hermes-mcp = "hermes_mcp.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/REPLACE_ME/hermes-mcp"
+Issues = "https://github.com/REPLACE_ME/hermes-mcp/issues"
+Changelog = "https://github.com/REPLACE_ME/hermes-mcp/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hermes_mcp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "S",   # flake8-bandit (security)
+    "RUF", # ruff-specific
+]
+ignore = [
+    "E501",  # line too long, ruff format handles this
+    "S101",  # asserts in tests are fine
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[[tool.mypy.overrides]]
+module = ["mcp.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

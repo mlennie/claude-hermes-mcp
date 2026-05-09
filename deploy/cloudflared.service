@@ -1,0 +1,14 @@
+[Unit]
+Description=Cloudflare Tunnel for hermes-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clawone
+ExecStart=/usr/bin/cloudflared tunnel --config /home/clawone/.cloudflared/config.yml run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
