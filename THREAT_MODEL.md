@@ -10,11 +10,12 @@
 [Claude.ai cloud]
        │  (HTTPS — Anthropic's servers and CDN)
        ▼
-[Claude Desktop / Mobile]  ← holds the bearer token
+[Claude Desktop / Mobile]  ← holds OAuth client_id + client_secret
        │  (HTTPS — cloudflared or ngrok tunnel)
        ▼
 [hermes-mcp]  ← this project
-  • validates bearer token
+  • OAuth 2.1 authorization code + PKCE
+  • mints opaque access tokens (in-memory, 1h TTL)
   • builds subprocess argv
   • runs hermes CLI
        │  (subprocess, local IPC)
@@ -26,7 +27,7 @@
 [Host OS / Internet]
 ```
 
-The bearer token is the only authentication mechanism. TLS is provided by the tunnel, not by hermes-mcp. Authorization (deciding whether a given prompt is acceptable) is delegated entirely to Hermes's approval hooks.
+OAuth 2.1 is the only authentication mechanism. The static client_id/client_secret pair is the long-lived credential; access tokens minted from it are short-lived (1h) and live only in memory. TLS is provided by the tunnel, not by hermes-mcp. Authorization (deciding whether a given prompt is acceptable) is delegated entirely to Hermes's approval hooks.
 
 ---
 
@@ -38,8 +39,8 @@ The bearer token is the only authentication mechanism. TLS is provided by the tu
 | `hermes-mcp` process | **Fully trusted** | This repo. Audit it. |
 | `hermes` binary | **Fully trusted** | hermes-mcp places no sandbox around it. |
 | Tunnel edge (cloudflared / ngrok) | **Trusted for transport** | We trust them not to MITM or replay. We do not trust them with secret contents — prompt bodies are encrypted in transit and hermes-mcp never passes bearer tokens to them. |
-| Bearer token holder | **Authenticated, not fully trusted** | Anyone who presents a valid token may call `hermes_ask`. They are not necessarily the human user. |
-| Claude Desktop / Mobile | **Trusted to authenticate** | Holds the bearer token. Relays prompts from Claude.ai. |
+| Access-token holder | **Authenticated, not fully trusted** | Anyone who presents a valid OAuth access token may call `hermes_ask`. They are not necessarily the human user. |
+| Claude Desktop / Mobile | **Trusted to authenticate** | Holds the OAuth `client_id` + `client_secret` and the resulting access tokens. Relays prompts from Claude.ai. |
 | Claude.ai (Anthropic's cloud) | **Trusted to authenticate, not to sanitize** | Controls what Claude "thinks" and therefore what prompts it sends. Not trusted to prevent prompt injection from Claude's context. |
 | Prompt content arriving at `hermes_ask` | **Untrusted input** | May contain injected instructions. |
 | Web content Hermes fetches | **Untrusted** | Not hermes-mcp's concern, but a live injection vector for Hermes. |
@@ -50,9 +51,14 @@ The bearer token is the only authentication mechanism. TLS is provided by the tu
 
 ### 1. Unauthenticated callers
 
-Any request missing a valid `Authorization: Bearer <token>` header is rejected with 401 before hermes is invoked. The comparison uses `hmac.compare_digest()`, which takes constant time regardless of token length, making timing-based extraction attacks impractical.
+Any request to `/mcp` missing a valid `Authorization: Bearer <access-token>` is rejected with 401 before hermes is invoked. Access tokens are minted only via the OAuth 2.1 authorization-code flow, which requires:
 
-**Residual risk:** If the token is weak (short, guessable) or leaked, this protection collapses. Use at least 32 bytes of random entropy (`openssl rand -hex 32`). The `doctor` command warns if the token is shorter than 32 characters.
+- knowledge of the long-lived `client_id` and `client_secret` (presented at `/token`),
+- a valid PKCE code-verifier matching the original code-challenge.
+
+Both client-secret comparison (at `/token`) and access-token verification (at `/mcp`) use `hmac.compare_digest()`, eliminating timing-based extraction.
+
+**Residual risk:** If the `client_secret` is weak (short, guessable) or leaked, this protection collapses. `mint-client` generates a fresh ≥40-character `secrets.token_urlsafe` value; configuration enforces ≥32 characters. Rotate (`hermes-mcp mint-client`, restart) if exposed.
 
 ### 2. Subprocess argument injection
 
@@ -64,15 +70,25 @@ This is verified in `tests/test_hermes_client.py`. Any PR that changes argv cons
 
 `HERMES_TIMEOUT_SECONDS` (default 300) terminates any subprocess that runs longer than the limit, and hermes-mcp raises a `HermesError` that the MCP framework surfaces as a tool error. This bounds the blast radius of a stuck or malicious Hermes call.
 
-### 4. Bearer-token leakage via logs
+### 4. Credential leakage via logs
 
 Prompt bodies are logged only at `DEBUG`. At the default `INFO` level, hermes-mcp logs only the argument count, whether a session ID is present, and elapsed time. This means your prompts do not appear in systemd journal or syslog under normal operation.
 
-Bearer token values are never logged at any level.
+`client_secret`, authorization codes, access tokens, and refresh tokens are never logged at any level. Token-mint events log only the TTL.
 
-### 5. Bearer-token leakage via timing
+### 5. Credential leakage via timing
 
-`hmac.compare_digest()` eliminates the short-circuit behavior of naive string comparison, removing the ability to brute-force the token character-by-character by measuring response latency.
+`hmac.compare_digest()` is used everywhere we compare secrets — `client_secret` at `/token`, access-token lookup at `/mcp`. This eliminates the short-circuit behavior of naive string comparison, removing the ability to brute-force secrets by measuring response latency.
+
+### 6. Authorization-code interception
+
+PKCE (S256, mandatory) binds each authorization code to a code-verifier known only to the legitimate client. Even if an attacker captures the code (via a compromised redirect or a logged URL), they cannot exchange it without the matching verifier. Combined with `client_secret` at `/token`, two independent secrets must be compromised to mint a token.
+
+Codes are single-use and expire 60 seconds after issuance.
+
+### 7. DNS rebinding
+
+The MCP transport layer rejects requests whose `Host` header is not in `MCP_ALLOWED_HOSTS` (plus localhost). This stops a malicious DNS response from rebinding the tunnel hostname to the attacker's machine.
 
 ---
 

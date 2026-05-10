@@ -1,7 +1,7 @@
 """Environment-variable configuration for hermes-mcp.
 
-All knobs documented in `.env.example`. The server refuses to start if
-MCP_BEARER_TOKEN is unset or empty — there is no default token, ever.
+All knobs documented in `.env.example`. The server refuses to start if any
+of OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, or OAUTH_ISSUER_URL is missing.
 """
 
 from __future__ import annotations
@@ -22,22 +22,44 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class Config:
-    bearer_token: str
+    oauth_client_id: str
+    oauth_client_secret: str
+    oauth_issuer_url: str
     hermes_bin: str
     bind_host: str
     bind_port: int
     hermes_timeout_seconds: int
     hermes_toolsets: tuple[str, ...]
+    allowed_hosts: tuple[str, ...]
     log_level: LogLevel
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
         e = env if env is not None else os.environ
 
-        token = (e.get("MCP_BEARER_TOKEN") or "").strip()
-        if not token:
+        client_id = (e.get("OAUTH_CLIENT_ID") or "").strip()
+        if not client_id:
             raise ConfigError(
-                "MCP_BEARER_TOKEN is required. Generate one with: openssl rand -hex 32"
+                "OAUTH_CLIENT_ID is required. Generate one with: hermes-mcp mint-client"
+            )
+
+        client_secret = (e.get("OAUTH_CLIENT_SECRET") or "").strip()
+        if not client_secret:
+            raise ConfigError(
+                "OAUTH_CLIENT_SECRET is required. Generate one with: hermes-mcp mint-client"
+            )
+        if len(client_secret) < 32:
+            raise ConfigError("OAUTH_CLIENT_SECRET must be at least 32 characters")
+
+        issuer_url = (e.get("OAUTH_ISSUER_URL") or "").strip().rstrip("/")
+        if not issuer_url:
+            raise ConfigError(
+                "OAUTH_ISSUER_URL is required (your public tunnel URL, "
+                "e.g. https://hermes.example.com)"
+            )
+        if not (issuer_url.startswith("https://") or issuer_url.startswith("http://localhost")):
+            raise ConfigError(
+                f"OAUTH_ISSUER_URL must be HTTPS (or http://localhost for testing), got {issuer_url}"
             )
 
         try:
@@ -59,6 +81,9 @@ class Config:
         toolsets_raw = (e.get("HERMES_TOOLSETS") or "").strip()
         toolsets = tuple(t.strip() for t in toolsets_raw.split(",") if t.strip())
 
+        allowed_hosts_raw = (e.get("MCP_ALLOWED_HOSTS") or "").strip()
+        allowed_hosts = tuple(h.strip() for h in allowed_hosts_raw.split(",") if h.strip())
+
         log_level_raw = (e.get("LOG_LEVEL") or "INFO").upper()
         if log_level_raw not in _VALID_LOG_LEVELS:
             raise ConfigError(
@@ -67,12 +92,15 @@ class Config:
         log_level: LogLevel = log_level_raw  # type: ignore[assignment]
 
         return cls(
-            bearer_token=token,
+            oauth_client_id=client_id,
+            oauth_client_secret=client_secret,
+            oauth_issuer_url=issuer_url,
             hermes_bin=(e.get("HERMES_BIN") or "hermes").strip(),
             bind_host=(e.get("BIND_HOST") or "127.0.0.1").strip(),
             bind_port=port,
             hermes_timeout_seconds=timeout,
             hermes_toolsets=toolsets,
+            allowed_hosts=allowed_hosts,
             log_level=log_level,
         )
 

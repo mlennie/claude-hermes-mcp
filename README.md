@@ -37,9 +37,12 @@ These steps assume you already have **Hermes Agent** installed and working on a 
 # 1. Install
 pipx install hermes-mcp
 
-# 2. Generate a strong bearer token
-export MCP_BEARER_TOKEN=$(openssl rand -hex 32)
-echo "$MCP_BEARER_TOKEN"   # save this — you'll paste it into Claude
+# 2. Mint OAuth client credentials and set OAUTH_ISSUER_URL to your tunnel URL
+hermes-mcp mint-client                              # prints OAUTH_CLIENT_ID + SECRET
+export OAUTH_CLIENT_ID=<from above>
+export OAUTH_CLIENT_SECRET=<from above>
+export OAUTH_ISSUER_URL=https://hermes.your-domain.example
+export MCP_ALLOWED_HOSTS=hermes.your-domain.example
 
 # 3. Verify everything is wired up
 hermes-mcp doctor
@@ -48,7 +51,7 @@ hermes-mcp doctor
 hermes-mcp serve
 ```
 
-In another terminal, expose `127.0.0.1:8765` over HTTPS via cloudflared (see below). Then in Claude Desktop or the Claude mobile app, **add a Custom Connector** pointing at your tunnel URL with the bearer token. You're done.
+In another terminal, expose `127.0.0.1:8765` over HTTPS via cloudflared (see below). Then in Claude Desktop or the Claude mobile app, **add a Custom Connector** pointing at `<tunnel-url>/mcp` and paste your `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET`. Claude completes the OAuth flow on its own. You're done.
 
 Try asking: *"Use Hermes to schedule a daily cron job that emails me a summary of my inbox at 8am."*
 
@@ -60,7 +63,10 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `MCP_BEARER_TOKEN` | **yes** | — | HTTP bearer secret. Server refuses to start if unset. Generate with `openssl rand -hex 32`. |
+| `OAUTH_CLIENT_ID` | **yes** | — | Static OAuth 2.1 client ID. Generate with `hermes-mcp mint-client`. |
+| `OAUTH_CLIENT_SECRET` | **yes** | — | Static OAuth 2.1 client secret (≥32 chars). Generate with `hermes-mcp mint-client`. |
+| `OAUTH_ISSUER_URL` | **yes** | — | Public HTTPS URL where the server is reachable (your tunnel hostname). |
+| `MCP_ALLOWED_HOSTS` | no | (localhost only) | Comma-separated additional Host header values to accept (typically your public tunnel hostname). MCP uses this for DNS-rebinding protection. |
 | `HERMES_BIN` | no | `hermes` (PATH) | Absolute path to hermes binary if not on PATH. |
 | `BIND_HOST` | no | `127.0.0.1` | Bind address. The tunnel reaches it on localhost. **Do not** bind `0.0.0.0` unless you understand the implications. |
 | `BIND_PORT` | no | `8765` | Port. |
@@ -135,7 +141,7 @@ A systemd unit is provided in [`deploy/ngrok.service`](deploy/ngrok.service).
 
 ## Adding the connector in Claude
 
-**Claude Desktop:** Settings → Connectors → Add custom connector → paste the HTTPS URL → set the bearer token in the Authorization header.
+**Claude Desktop:** Settings → Connectors → Add custom connector → paste `<tunnel-url>/mcp` → paste your `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET`. Claude completes the OAuth 2.1 authorization-code flow with PKCE automatically.
 
 **Claude mobile app:** same flow under Settings → Connectors. The connector you add is per-account, so it works on both Desktop and mobile from one configuration.
 
@@ -159,20 +165,21 @@ journalctl -u hermes-mcp -f
 
 - **Do not run Hermes with `--yolo`.** Keep approval hooks on.
 - **Scope `HERMES_TOOLSETS`** to the minimum your use case needs.
-- **The bearer token is a credential.** A leaked token = remote action execution on your mini-PC. Rotate immediately if exposed.
+- **The OAuth client_secret is a credential.** A leaked secret + the issuer URL is enough to mint access tokens against your bridge. Rotate (`hermes-mcp mint-client`, restart) if exposed.
 - **Prompt injection is real.** A malicious prompt slipping into Claude's context (via a webpage, a file you pasted) can craft tool calls. Hermes's own approval hooks are your last line of defense — keep them on.
 
 Code-side mitigations baked in:
 
 - `subprocess.run` with argument lists; `shell=True` is never used.
-- `MCP_BEARER_TOKEN` required at startup; comparison via `hmac.compare_digest`.
+- OAuth 2.1 with PKCE; client_secret comparison via `hmac.compare_digest`. Access tokens are 256-bit random opaque strings, expire after 1 hour, and live only in memory (no on-disk persistence).
 - Prompt bodies logged only at `DEBUG`. INFO logs are length + session_id + duration only.
 - **No telemetry, ever.** Your prompts go Claude → tunnel edge → your mini-PC → Hermes. Nothing else.
 
 ## Common pitfalls
 
 - **`hermes` not on PATH** → set `HERMES_BIN` to its absolute path.
-- **Connector stuck on "Verifying"** → 9 times out of 10 it's a wrong bearer token. Re-paste it.
+- **Connector stuck on "Verifying"** → 9 times out of 10 it's a wrong client_id or client_secret, or `OAUTH_ISSUER_URL` doesn't match the URL you pasted into Claude. They must be the same hostname.
+- **"Invalid Host header" / 421** → your tunnel hostname isn't in `MCP_ALLOWED_HOSTS`. Add it (comma-separated) and restart.
 - **Cloudflared 502** → your `hermes-mcp` service isn't running. `journalctl -u hermes-mcp` will tell you why.
 - **Cron jobs scheduled via Hermes don't fire** → check that `HERMES_HOME` in the systemd `EnvironmentFile` matches the user that owns the Hermes data directory. By default Hermes uses `$HOME/.hermes`.
 

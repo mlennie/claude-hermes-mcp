@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (BREAKING)
+- Auth replaced: OAuth 2.1 (authorization code + PKCE) instead of a single bearer token.
+  Claude Desktop's Custom Connector UI requires this.
+  - New required env vars: `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, `OAUTH_ISSUER_URL`.
+  - Removed: `MCP_BEARER_TOKEN`.
+- New `hermes-mcp mint-client` subcommand to generate a fresh client_id / client_secret.
+- `MCP_ALLOWED_HOSTS` env var added so DNS-rebinding protection accepts the tunnel hostname.
+
 ## [0.1.0] - TBD
 
 ### Added

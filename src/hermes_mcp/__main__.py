@@ -10,9 +10,23 @@ from . import __version__
 from .config import Config, ConfigError, configure_logging
 from .doctor import DoctorError, run_checks
 from .hermes_client import HermesClient
+from .oauth import mint_client_credentials
 from .server import serve
 
 logger = logging.getLogger("hermes_mcp")
+
+
+def _mint_client() -> int:
+    client_id, client_secret = mint_client_credentials()
+    print("# Paste these into /etc/hermes-mcp.env (or your shell):")
+    print(f"OAUTH_CLIENT_ID={client_id}")
+    print(f"OAUTH_CLIENT_SECRET={client_secret}")
+    print()
+    print("# Then in Claude Desktop > Settings > Connectors > Add custom connector:")
+    print("#   URL:           https://<your-tunnel-host>/mcp")
+    print(f"#   Client ID:     {client_id}")
+    print(f"#   Client Secret: {client_secret}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -25,10 +39,17 @@ def main(argv: list[str] | None = None) -> int:
         "command",
         nargs="?",
         default="serve",
-        choices=("serve", "doctor"),
-        help="serve (default): run the MCP server. doctor: run startup checks and exit.",
+        choices=("serve", "doctor", "mint-client"),
+        help=(
+            "serve (default): run the MCP server. "
+            "doctor: run startup checks and exit. "
+            "mint-client: print a fresh OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET pair."
+        ),
     )
     args = parser.parse_args(argv)
+
+    if args.command == "mint-client":
+        return _mint_client()
 
     try:
         config = Config.from_env()

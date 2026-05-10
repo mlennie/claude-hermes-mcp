@@ -58,11 +58,5 @@ def run_checks(config: Config) -> DoctorResult:
         else "unknown"
     )
 
-    if len(config.bearer_token) < 32:
-        logger.warning(
-            "MCP_BEARER_TOKEN is shorter than 32 chars; consider regenerating with "
-            "`openssl rand -hex 32`."
-        )
-
     logger.info("doctor: hermes ok at %s — %s", hermes_path, version)
     return DoctorResult(hermes_path=hermes_path, hermes_version=version)

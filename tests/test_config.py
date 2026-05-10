@@ -4,57 +4,104 @@ import pytest
 
 from hermes_mcp.config import Config, ConfigError
 
+VALID_BASE: dict[str, str] = {
+    "OAUTH_CLIENT_ID": "hermes-mcp-test",
+    "OAUTH_CLIENT_SECRET": "x" * 32,
+    "OAUTH_ISSUER_URL": "https://hermes.example.com",
+}
 
-def test_requires_bearer_token() -> None:
-    with pytest.raises(ConfigError, match="MCP_BEARER_TOKEN is required"):
-        Config.from_env({})
+
+def test_requires_oauth_client_id() -> None:
+    env = {**VALID_BASE}
+    env.pop("OAUTH_CLIENT_ID")
+    with pytest.raises(ConfigError, match="OAUTH_CLIENT_ID is required"):
+        Config.from_env(env)
 
 
-def test_blank_token_rejected() -> None:
-    with pytest.raises(ConfigError, match="MCP_BEARER_TOKEN is required"):
-        Config.from_env({"MCP_BEARER_TOKEN": "   "})
+def test_requires_oauth_client_secret() -> None:
+    env = {**VALID_BASE}
+    env.pop("OAUTH_CLIENT_SECRET")
+    with pytest.raises(ConfigError, match="OAUTH_CLIENT_SECRET is required"):
+        Config.from_env(env)
+
+
+def test_short_client_secret_rejected() -> None:
+    env = {**VALID_BASE, "OAUTH_CLIENT_SECRET": "short"}
+    with pytest.raises(ConfigError, match="at least 32 characters"):
+        Config.from_env(env)
+
+
+def test_requires_issuer_url() -> None:
+    env = {**VALID_BASE}
+    env.pop("OAUTH_ISSUER_URL")
+    with pytest.raises(ConfigError, match="OAUTH_ISSUER_URL is required"):
+        Config.from_env(env)
+
+
+def test_issuer_url_must_be_https_or_localhost() -> None:
+    env = {**VALID_BASE, "OAUTH_ISSUER_URL": "http://example.com"}
+    with pytest.raises(ConfigError, match="must be HTTPS"):
+        Config.from_env(env)
+
+
+def test_localhost_http_issuer_allowed() -> None:
+    cfg = Config.from_env({**VALID_BASE, "OAUTH_ISSUER_URL": "http://localhost:8765"})
+    assert cfg.oauth_issuer_url == "http://localhost:8765"
+
+
+def test_issuer_url_trailing_slash_stripped() -> None:
+    cfg = Config.from_env({**VALID_BASE, "OAUTH_ISSUER_URL": "https://hermes.example.com/"})
+    assert cfg.oauth_issuer_url == "https://hermes.example.com"
 
 
 def test_minimal_valid_config() -> None:
-    cfg = Config.from_env({"MCP_BEARER_TOKEN": "x" * 32})
-    assert cfg.bearer_token == "x" * 32
+    cfg = Config.from_env(VALID_BASE)
+    assert cfg.oauth_client_id == "hermes-mcp-test"
+    assert cfg.oauth_client_secret == "x" * 32
+    assert cfg.oauth_issuer_url == "https://hermes.example.com"
     assert cfg.hermes_bin == "hermes"
     assert cfg.bind_host == "127.0.0.1"
     assert cfg.bind_port == 8765
     assert cfg.hermes_timeout_seconds == 300
     assert cfg.hermes_toolsets == ()
+    assert cfg.allowed_hosts == ()
     assert cfg.log_level == "INFO"
 
 
 def test_port_range_validated() -> None:
     with pytest.raises(ConfigError, match=r"BIND_PORT must be in 1\.\.65535"):
-        Config.from_env({"MCP_BEARER_TOKEN": "tok", "BIND_PORT": "0"})
+        Config.from_env({**VALID_BASE, "BIND_PORT": "0"})
     with pytest.raises(ConfigError, match=r"BIND_PORT must be in 1\.\.65535"):
-        Config.from_env({"MCP_BEARER_TOKEN": "tok", "BIND_PORT": "70000"})
+        Config.from_env({**VALID_BASE, "BIND_PORT": "70000"})
 
 
 def test_port_must_be_integer() -> None:
     with pytest.raises(ConfigError, match="BIND_PORT must be an integer"):
-        Config.from_env({"MCP_BEARER_TOKEN": "tok", "BIND_PORT": "abc"})
+        Config.from_env({**VALID_BASE, "BIND_PORT": "abc"})
 
 
 def test_timeout_validated() -> None:
     with pytest.raises(ConfigError, match="HERMES_TIMEOUT_SECONDS must be positive"):
-        Config.from_env({"MCP_BEARER_TOKEN": "tok", "HERMES_TIMEOUT_SECONDS": "0"})
+        Config.from_env({**VALID_BASE, "HERMES_TIMEOUT_SECONDS": "0"})
 
 
 def test_toolsets_parsed() -> None:
-    cfg = Config.from_env(
-        {"MCP_BEARER_TOKEN": "tok", "HERMES_TOOLSETS": "web, filesystem ,, email "}
-    )
+    cfg = Config.from_env({**VALID_BASE, "HERMES_TOOLSETS": "web, filesystem ,, email "})
     assert cfg.hermes_toolsets == ("web", "filesystem", "email")
+
+
+def test_allowed_hosts_parsed() -> None:
+    cfg = Config.from_env(
+        {**VALID_BASE, "MCP_ALLOWED_HOSTS": "hermes.example.com,foo.trycloudflare.com"}
+    )
+    assert cfg.allowed_hosts == ("hermes.example.com", "foo.trycloudflare.com")
 
 
 def test_log_level_validated() -> None:
     with pytest.raises(ConfigError, match="LOG_LEVEL must be one of"):
-        Config.from_env({"MCP_BEARER_TOKEN": "tok", "LOG_LEVEL": "VERBOSE"})
+        Config.from_env({**VALID_BASE, "LOG_LEVEL": "VERBOSE"})
 
 
 def test_log_level_normalized_to_upper() -> None:
-    cfg = Config.from_env({"MCP_BEARER_TOKEN": "tok", "LOG_LEVEL": "debug"})
+    cfg = Config.from_env({**VALID_BASE, "LOG_LEVEL": "debug"})
     assert cfg.log_level == "DEBUG"
