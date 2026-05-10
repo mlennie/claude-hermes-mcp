@@ -26,12 +26,13 @@ class DoctorResult:
 
 
 def run_checks(config: Config) -> DoctorResult:
-    hermes_path = shutil.which(config.hermes_bin) or config.hermes_bin
-    if not shutil.which(hermes_path):
+    resolved = shutil.which(config.hermes_bin)
+    if resolved is None:
         raise DoctorError(
             f"hermes binary not found: {config.hermes_bin!r}. "
             "Install Hermes Agent or set HERMES_BIN to its absolute path."
         )
+    hermes_path = resolved
 
     try:
         result = subprocess.run(  # noqa: S603 — argv list, no shell

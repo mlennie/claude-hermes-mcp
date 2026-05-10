@@ -6,7 +6,10 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from hermes_mcp.config import Config
+from hermes_mcp.hermes_client import HermesError
 from hermes_mcp.server import build_app
 
 
@@ -33,3 +36,14 @@ def test_hermes_ask_invokes_client() -> None:
     result = fn(prompt="hi", session_id=None, toolsets=None)
     assert result == "the answer"
     client.ask.assert_called_once_with("hi", session_id=None, toolsets=None)
+
+
+def test_hermes_ask_propagates_hermes_error() -> None:
+    cfg = _config()
+    client = MagicMock()
+    client.ask.side_effect = HermesError("hermes exited 2: boom")
+    mcp, _ = build_app(cfg, client)
+    tool = mcp._tool_manager.get_tool("hermes_ask")
+    assert tool is not None
+    with pytest.raises(HermesError, match="hermes exited 2"):
+        tool.fn(prompt="hi", session_id=None, toolsets=None)

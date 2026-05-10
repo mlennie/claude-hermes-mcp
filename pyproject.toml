@@ -48,9 +48,9 @@ dev = [
 hermes-mcp = "hermes_mcp.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/REPLACE_ME/hermes-mcp"
-Issues = "https://github.com/REPLACE_ME/hermes-mcp/issues"
-Changelog = "https://github.com/REPLACE_ME/hermes-mcp/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/mlennie/claude-hermes-mcp"
+Issues = "https://github.com/mlennie/claude-hermes-mcp/issues"
+Changelog = "https://github.com/mlennie/claude-hermes-mcp/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hermes_mcp"]

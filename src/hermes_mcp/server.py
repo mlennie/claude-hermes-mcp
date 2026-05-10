@@ -7,14 +7,28 @@ via uvicorn.
 from __future__ import annotations
 
 import logging
-from typing import Literal, cast
+from typing import Literal
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 
 from .auth import BearerAuthMiddleware
-from .config import Config
-from .hermes_client import HermesClient, HermesError
+from .config import Config, LogLevel
+from .hermes_client import HermesClient
+
+UvicornLogLevel = Literal["critical", "error", "warning", "info", "debug"]
+_UVICORN_LEVELS: dict[LogLevel, UvicornLogLevel] = {
+    "DEBUG": "debug",
+    "INFO": "info",
+    "WARNING": "warning",
+    "ERROR": "error",
+    "CRITICAL": "critical",
+}
+
+
+def _uvicorn_log_level(level: LogLevel) -> UvicornLogLevel:
+    return _UVICORN_LEVELS[level]
+
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +62,7 @@ def build_app(config: Config, client: HermesClient) -> tuple[FastMCP, BearerAuth
         "hermes-mcp",
         host=config.bind_host,
         port=config.bind_port,
-        log_level=config.log_level,  # type: ignore[arg-type]
+        log_level=config.log_level,
         stateless_http=False,
     )
 
@@ -58,11 +72,8 @@ def build_app(config: Config, client: HermesClient) -> tuple[FastMCP, BearerAuth
         session_id: str | None = None,
         toolsets: list[str] | None = None,
     ) -> str:
-        try:
-            return client.ask(prompt, session_id=session_id, toolsets=toolsets)
-        except HermesError as exc:
-            # Re-raise as ValueError so MCP returns a clean tool error to the client.
-            raise ValueError(str(exc)) from exc
+        # HermesError propagates; FastMCP wraps any Exception in ToolError.
+        return client.ask(prompt, session_id=session_id, toolsets=toolsets)
 
     starlette_app = mcp.streamable_http_app()
     wrapped = BearerAuthMiddleware(starlette_app, expected_token=config.bearer_token)
@@ -76,13 +87,9 @@ def serve(config: Config, client: HermesClient) -> None:
         config.bind_host,
         config.bind_port,
     )
-    _log_level = config.log_level.lower()
     uvicorn.run(
         app,
         host=config.bind_host,
         port=config.bind_port,
-        log_level=cast(
-            Literal["critical", "error", "warning", "info", "debug", "trace"],
-            _log_level,
-        ),
+        log_level=_uvicorn_log_level(config.log_level),
     )

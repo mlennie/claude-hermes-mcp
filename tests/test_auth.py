@@ -57,3 +57,35 @@ def test_uses_constant_time_compare() -> None:
     import hermes_mcp.auth as auth_mod
 
     assert auth_mod.hmac.compare_digest is not None
+
+
+def test_duplicate_authorization_headers_rejected() -> None:
+    token = "secret-token-123456789012345678901234"
+    client = _build_client(token=token)
+    # httpx accepts multiple values for the same header name when passed as a list.
+    response = client.get(
+        "/",
+        headers=[("Authorization", f"Bearer {token}"), ("Authorization", f"Bearer {token}")],
+    )
+    assert response.status_code == 401
+
+
+def test_non_http_scope_passes_through() -> None:
+    """Lifespan and websocket scopes must not be intercepted."""
+    import asyncio
+
+    seen: list[str] = []
+
+    async def inner_app(scope, receive, send):  # type: ignore[no-untyped-def]
+        seen.append(scope["type"])
+
+    middleware = BearerAuthMiddleware(inner_app, expected_token="t" * 32)
+
+    async def _noop_receive() -> dict[str, str]:
+        return {"type": "lifespan.startup"}
+
+    async def _noop_send(_message: dict[str, str]) -> None:
+        return None
+
+    asyncio.run(middleware({"type": "lifespan"}, _noop_receive, _noop_send))
+    assert seen == ["lifespan"]

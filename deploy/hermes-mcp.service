@@ -1,6 +1,6 @@
 [Unit]
 Description=Hermes MCP Bridge
-Documentation=https://github.com/REPLACE_ME/hermes-mcp
+Documentation=https://github.com/mlennie/claude-hermes-mcp
 After=network-online.target
 Wants=network-online.target
 

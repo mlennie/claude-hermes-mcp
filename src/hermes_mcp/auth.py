@@ -44,14 +44,15 @@ class BearerAuthMiddleware:
         await self._app(scope, receive, send)
 
     def _authorized(self, scope: Scope) -> bool:
-        for name, value in scope.get("headers", []):
-            if name.lower() == _AUTH_HEADER:
-                try:
-                    decoded = value.decode("latin-1")
-                except UnicodeDecodeError:
-                    return False
-                if not decoded.startswith(_BEARER_PREFIX):
-                    return False
-                token = decoded[len(_BEARER_PREFIX) :].strip()
-                return hmac.compare_digest(token, self._expected)
-        return False
+        matches = [v for n, v in scope.get("headers", []) if n.lower() == _AUTH_HEADER]
+        if len(matches) != 1:
+            # Reject 0 (no header) and 2+ (ambiguous / smuggling-shaped) alike.
+            return False
+        try:
+            decoded = matches[0].decode("ascii")
+        except UnicodeDecodeError:
+            return False
+        if not decoded.startswith(_BEARER_PREFIX):
+            return False
+        token = decoded[len(_BEARER_PREFIX) :].strip()
+        return hmac.compare_digest(token, self._expected)

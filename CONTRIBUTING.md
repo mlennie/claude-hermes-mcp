@@ -5,8 +5,8 @@ Thanks for considering a contribution. This project is small on purpose — a fo
 ## Quick start
 
 ```bash
-git clone https://github.com/REPLACE_ME/hermes-mcp.git
-cd hermes-mcp
+git clone https://github.com/mlennie/claude-hermes-mcp.git
+cd claude-hermes-mcp
 uv venv .venv --python 3.11
 source .venv/bin/activate
 uv pip install -e ".[dev]"

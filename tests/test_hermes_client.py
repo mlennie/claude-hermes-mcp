@@ -69,7 +69,7 @@ def test_ask_returns_stripped_stdout() -> None:
     assert out == "hermes says hi"
     args, kwargs = run.call_args
     assert kwargs["timeout"] == 60
-    assert kwargs.get("shell") is None or kwargs["shell"] is False
+    assert kwargs.get("shell", False) is False
     assert args[0] == ["hermes", "-z", "ping"]
 
 

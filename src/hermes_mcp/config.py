@@ -8,7 +8,12 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from dataclasses import dataclass
+from typing import Literal
+
+LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+_VALID_LOG_LEVELS: frozenset[str] = frozenset(("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
 
 
 class ConfigError(Exception):
@@ -23,7 +28,7 @@ class Config:
     bind_port: int
     hermes_timeout_seconds: int
     hermes_toolsets: tuple[str, ...]
-    log_level: str
+    log_level: LogLevel
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
@@ -54,9 +59,12 @@ class Config:
         toolsets_raw = (e.get("HERMES_TOOLSETS") or "").strip()
         toolsets = tuple(t.strip() for t in toolsets_raw.split(",") if t.strip())
 
-        log_level = (e.get("LOG_LEVEL") or "INFO").upper()
-        if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
-            raise ConfigError(f"LOG_LEVEL must be one of DEBUG/INFO/WARNING/ERROR, got {log_level}")
+        log_level_raw = (e.get("LOG_LEVEL") or "INFO").upper()
+        if log_level_raw not in _VALID_LOG_LEVELS:
+            raise ConfigError(
+                f"LOG_LEVEL must be one of DEBUG/INFO/WARNING/ERROR/CRITICAL, got {log_level_raw}"
+            )
+        log_level: LogLevel = log_level_raw  # type: ignore[assignment]
 
         return cls(
             bearer_token=token,
@@ -69,9 +77,9 @@ class Config:
         )
 
 
-def configure_logging(level: str) -> None:
+def configure_logging(level: LogLevel) -> None:
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=__import__("sys").stderr,
+        stream=sys.stderr,
     )
