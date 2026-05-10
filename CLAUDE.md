@@ -58,16 +58,19 @@ The five source modules in `src/hermes_mcp/` have clean single responsibilities:
 
 - All four required env vars must be set or the server refuses to start.
 - `client_secret` comparison uses `hmac.compare_digest()` (delegated to the MCP SDK's `ClientAuthenticator`).
-- Access tokens are in-memory only — by design. Restart invalidates all sessions; Claude re-auths transparently using its refresh token if the refresh hasn't expired (and re-auths from scratch otherwise).
+- Access tokens are in-memory only — by design. Restart invalidates all sessions. **Claude Desktop does NOT re-auth transparently** in practice: it surfaces "Error occurred during tool execution" on the next call and the user has to manually Disconnect / Reconnect the connector once. The `client_id` / `client_secret` are saved on the connector, so the reconnect doesn't require re-pasting credentials. (Persisting tokens to disk to fix this is on the v0.3.0 roadmap.)
 - Refresh-token rotation is **atomic-pop-then-mint** in `oauth.py` — concurrent `/token` requests with the same refresh token cannot both succeed.
 - Prompt content must only be logged at DEBUG level, not INFO (privacy by default). The `state` query parameter is sanitized before logging.
 - `BIND_HOST` defaults to `127.0.0.1`; binding elsewhere gets a startup warning.
 - mypy is run on `src/` only — the `mcp` package lacks stubs and is excluded.
 - Python ≥ 3.11 required; CI tests 3.11 and 3.12.
+- Test count is 76 as of v0.2.0; a sudden drop is a regression smell.
 
 ## Deployment shape
 
 This project ships with `deploy/hermes-mcp.service` and `deploy/cloudflared.service` as **systemd user units** (matching the `hermes-gateway` / `mcp-proxy` services it sits next to). Env file lives at `~/.config/hermes-mcp/env` mode 0600. `loginctl enable-linger` is required so user services start at boot.
+
+`deploy/hermes-mcp.service` ships with non-trivial hardening flags: `ProtectSystem=strict`, `ProtectHome=read-only` + `ReadWritePaths=%h/.config/hermes-mcp`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `LockPersonality=true`, `MemoryDenyWriteExecute=true`, empty `CapabilityBoundingSet=`, and `SystemCallFilter=@system-service` (excluding `@privileged @resources`). They are verified to start cleanly with the current Python deps; **do not strip them without intent** and re-test the service start. If a future dependency needs JIT or syscalls outside `@system-service`, narrow the rule rather than removing it.
 
 ## Release process
 
