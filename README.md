@@ -228,6 +228,26 @@ journalctl --user -u hermes-mcp -f
 
 Restart after editing the env file: `systemctl --user restart hermes-mcp`.
 
+### What survives a reboot
+
+| Concern | Behavior |
+|---|---|
+| `hermes-mcp` process | Starts at boot. ✅ |
+| `cloudflared` tunnel | Starts at boot. ✅ |
+| Tunnel URL | Stable (named tunnel). ✅ |
+| OAuth `client_id` / `client_secret` | Read from `~/.config/hermes-mcp/env` at startup. ✅ |
+| Live OAuth access / refresh tokens | **Stored in memory only — lost on every restart.** ❌ |
+
+**Practical impact:** the host can reboot freely; the bridge comes back up on the same URL. But Claude Desktop is holding access and refresh tokens that are now invalid (the in-memory store they were minted from is gone). On the next call, Claude usually reports `"Error occurred during tool execution"` rather than transparently re-running OAuth.
+
+**The fix is one click**, not re-entering credentials:
+
+> Claude Desktop → **Settings → Connectors** → click your `hermes-mcp` connector → **Disconnect** → **Reconnect**.
+
+Claude does the OAuth flow against the bridge using the saved `client_id` / `client_secret` and you're back online. Same goes for any time you `systemctl --user restart hermes-mcp` (e.g. after editing the env file or upgrading the package).
+
+This is a known limitation of the in-memory token store. Persisting tokens to disk is on the roadmap.
+
 ## Security
 
 **This bridge lets a remote LLM run actions on your machine via Hermes.** Treat it accordingly. Full threat model in [THREAT_MODEL.md](THREAT_MODEL.md). In short:
@@ -254,7 +274,7 @@ Code-side mitigations baked in:
 - **Connector stuck on "Verifying"** → 9 times out of 10 it's a wrong `client_id` or `client_secret`, or `OAUTH_ISSUER_URL` doesn't match the URL you pasted into Claude. They must be the same hostname.
 - **"Invalid Host header" / 421** → your tunnel hostname isn't in `MCP_ALLOWED_HOSTS`. Add it (comma-separated) and restart.
 - **Cloudflared 502** → `hermes-mcp` isn't running. `journalctl --user -u hermes-mcp` will tell you why.
-- **Restart invalidates Claude's tokens** → expected; refresh tokens are in-memory. Claude's next call triggers a transparent re-auth using the long-lived `client_secret`. If that also fails (e.g., refresh token expired), open the connector once in Claude Desktop to re-authorize.
+- **After a reboot or `systemctl --user restart hermes-mcp`, Claude says "Error occurred during tool execution"** → expected. OAuth tokens are in-memory; restarting the bridge invalidates them. **Fix:** in Claude Desktop, Settings → Connectors → your hermes-mcp connector → Disconnect → Reconnect. The `client_id`/`client_secret` are saved, so Claude re-auths in a few seconds. See [What survives a reboot](#what-survives-a-reboot).
 
 ## Contributing
 
