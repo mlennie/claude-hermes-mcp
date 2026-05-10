@@ -1,4 +1,5 @@
-"""Startup self-checks. Verifies hermes is invocable and toolsets exist.
+"""Startup self-checks. Verifies the Hermes gateway is reachable and the
+configured API key works.
 
 Fails loudly with actionable messages — never a Python traceback.
 """
@@ -6,9 +7,9 @@ Fails loudly with actionable messages — never a Python traceback.
 from __future__ import annotations
 
 import logging
-import shutil
-import subprocess
 from dataclasses import dataclass
+
+import httpx
 
 from .config import Config
 
@@ -21,42 +22,60 @@ class DoctorError(Exception):
 
 @dataclass(frozen=True)
 class DoctorResult:
-    hermes_path: str
-    hermes_version: str
+    gateway_url: str
+    gateway_models: tuple[str, ...]
 
 
 def run_checks(config: Config) -> DoctorResult:
-    resolved = shutil.which(config.hermes_bin)
-    if resolved is None:
+    health_url = config.hermes_api_url.rstrip("/") + "/v1/health"
+    try:
+        health = httpx.get(health_url, timeout=5, follow_redirects=False)
+    except httpx.HTTPError as exc:
         raise DoctorError(
-            f"hermes binary not found: {config.hermes_bin!r}. "
-            "Install Hermes Agent or set HERMES_BIN to its absolute path."
+            f"hermes gateway unreachable at {health_url}: {exc}. "
+            "Is `hermes-gateway` running? `systemctl --user status hermes-gateway`."
+        ) from exc
+    if health.status_code != 200:
+        raise DoctorError(
+            f"hermes gateway returned {health.status_code} on /v1/health "
+            f"(expected 200). url={health_url}"
         )
-    hermes_path = resolved
+
+    models_url = config.hermes_api_url.rstrip("/") + "/v1/models"
+    try:
+        models = httpx.get(
+            models_url,
+            headers={"Authorization": f"Bearer {config.hermes_api_key}"},
+            timeout=5,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError as exc:
+        raise DoctorError(f"hermes gateway /v1/models request failed: {exc}") from exc
+    if models.status_code == 401:
+        raise DoctorError(
+            "hermes gateway rejected the API key (401 on /v1/models). "
+            "Check HERMES_API_KEY matches API_SERVER_KEY in ~/.hermes/.env."
+        )
+    if models.status_code != 200:
+        raise DoctorError(
+            f"hermes gateway /v1/models returned {models.status_code} "
+            f"(expected 200). body: {models.text[:300]!r}"
+        )
 
     try:
-        result = subprocess.run(  # noqa: S603 — argv list, no shell
-            [hermes_path, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise DoctorError(f"hermes --version timed out after 15s ({hermes_path})") from exc
-    except OSError as exc:
-        raise DoctorError(f"failed to invoke {hermes_path}: {exc}") from exc
+        data = models.json()
+        model_ids = tuple(m["id"] for m in data.get("data", []))
+    except (ValueError, KeyError, TypeError) as exc:
+        raise DoctorError(f"hermes gateway /v1/models returned malformed JSON: {exc}") from exc
 
-    if result.returncode != 0:
-        raise DoctorError(
-            f"hermes --version exited {result.returncode}. stderr: {result.stderr.strip()[:500]}"
+    if config.hermes_model not in model_ids:
+        logger.warning(
+            "configured HERMES_MODEL %r not in /v1/models %s — request may 404 at runtime",
+            config.hermes_model,
+            list(model_ids),
         )
 
-    version = (
-        (result.stdout or result.stderr).strip().splitlines()[0]
-        if (result.stdout or result.stderr)
-        else "unknown"
+    logger.info(
+        "doctor: hermes gateway ok at %s — models=%s", config.hermes_api_url, list(model_ids)
     )
-
-    logger.info("doctor: hermes ok at %s — %s", hermes_path, version)
-    return DoctorResult(hermes_path=hermes_path, hermes_version=version)
+    return DoctorResult(gateway_url=config.hermes_api_url, gateway_models=model_ids)

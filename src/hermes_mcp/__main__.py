@@ -66,13 +66,17 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     if args.command == "doctor":
-        print(f"hermes-mcp doctor: ok ({result.hermes_version})")
+        print(
+            f"hermes-mcp doctor: ok (gateway={result.gateway_url}, "
+            f"models={list(result.gateway_models)})"
+        )
         return 0
 
     client = HermesClient(
-        hermes_bin=result.hermes_path,
-        timeout_seconds=config.hermes_timeout_seconds,
-        default_toolsets=config.hermes_toolsets,
+        api_url=config.hermes_api_url,
+        api_key=config.hermes_api_key,
+        model=config.hermes_model,
+        timeout_seconds=config.hermes_request_timeout_seconds,
     )
 
     try:

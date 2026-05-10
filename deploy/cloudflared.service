@@ -1,14 +1,15 @@
 [Unit]
 Description=Cloudflare Tunnel for hermes-mcp
+Documentation=https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=clawone
-ExecStart=/usr/bin/cloudflared tunnel --config /home/clawone/.cloudflared/config.yml run
+# Install as a systemd --user unit at ~/.config/systemd/user/cloudflared.service
+ExecStart=/usr/local/bin/cloudflared tunnel --config %h/.cloudflared/config.yml run
 Restart=on-failure
 RestartSec=5
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

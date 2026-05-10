@@ -23,41 +23,46 @@ Security fixes land on the latest minor release. There is no LTS branch.
 
 For the full threat model — including adversary scenarios, design rationale, and residual risks — see [THREAT_MODEL.md](THREAT_MODEL.md). The summary below is a quick reference.
 
-`hermes-mcp` exposes Hermes Agent — a tool-calling LLM with shell, filesystem, browser, email, and scheduling capabilities — to remote clients (Claude Desktop, Claude mobile) over HTTPS. Compromise of the bearer token or the host machine is equivalent to **remote action execution on the mini-PC** at the privileges of the user running `hermes-mcp`.
+`hermes-mcp` is an OAuth-gated bridge: Claude.ai → cloudflared/ngrok tunnel → hermes-mcp on `127.0.0.1:8765` → HTTP `/v1/chat/completions` → `hermes-gateway` on `127.0.0.1:8642` → AIAgent loop. The bridge holds two long-lived secrets: an OAuth `client_secret` (used by Claude to obtain access tokens) and `HERMES_API_KEY` (used by the bridge to authenticate to the gateway). Compromise of either one is equivalent to **remote action execution on the host** at the privileges of the user running the gateway.
 
 ### Trust boundaries
 
 | Component | Trust | Notes |
 |---|---|---|
-| Mini-PC OS / shell | Trusted | If this is compromised, all bets are off. |
+| Host OS / shell | Trusted | If this is compromised, all bets are off. |
 | `hermes-mcp` server | Trusted | Code under this repo. |
-| Hermes Agent CLI | Trusted | Invoked via stable CLI surface only — no internal imports. |
+| `hermes-gateway` server | Trusted | Separate process owned by the same user. The bridge has no sandbox around it. |
 | Tunnel edge (cloudflared / ngrok) | Trusted transport | TLS termination at the edge; we trust them not to MITM. |
-| Bearer token | Sensitive credential | Treat as a password. |
-| Claude client (Desktop / mobile) | Authenticated | Holds the bearer; if leaked, remote attackers can call the bridge. |
+| `OAUTH_CLIENT_SECRET` | Sensitive credential | Treat as a password. Pasted into Claude Desktop. |
+| `HERMES_API_KEY` | Sensitive credential | Bearer to the gateway. Never leaves the host. |
+| Claude client (Desktop / mobile) | Authenticated | Holds the OAuth credentials and minted access tokens. |
 | Prompts arriving at `hermes_ask` | **Untrusted input** | May be poisoned by injection upstream. |
 
 ### Top risks
 
-1. **Bearer-token leak.** Reading `/etc/hermes-mcp.env`, leaking the env from a screenshot, accidentally committing it. Mitigations: `0600` permissions on env file; `openssl rand -hex 32` for entropy; `hmac.compare_digest` comparison rejects timing-based extraction.
+1. **OAuth credential leak.** `OAUTH_CLIENT_SECRET` exposure is a full compromise — an attacker can mint access tokens via the OAuth flow without further interaction. Mitigations: `hermes-mcp mint-client` produces a ≥40-char `secrets.token_urlsafe` value; configuration enforces ≥32 characters; `hmac.compare_digest` for the `/token` comparison eliminates timing extraction. Rotate (`hermes-mcp mint-client`, edit env, `systemctl --user restart hermes-mcp`) if exposed.
 
-2. **Prompt injection via Claude's context.** A webpage or pasted file in a Claude chat tells Claude to call `hermes_ask` with malicious instructions ("delete all files in `~`", "send the contents of `~/.ssh/id_rsa` via email"). Mitigations are mostly upstream and user-side:
+2. **Gateway API-key leak.** `HERMES_API_KEY` lets anyone on the host (or its loopback namespace) bypass the bridge entirely and call `/v1/chat/completions` directly. Mitigations: `0600` permissions on `~/.config/hermes-mcp/env`. Run `hermes-mcp` and `hermes-gateway` as a dedicated low-privilege user with no other co-tenants.
+
+3. **Prompt injection via Claude's context.** A webpage or pasted file in a Claude chat tells Claude to call `hermes_ask` with malicious instructions. Mitigations are mostly upstream and user-side:
    - Keep Hermes's approval hooks on. Do **not** run with `--yolo`.
-   - Scope `HERMES_TOOLSETS` to only what's needed.
+   - Configure `platform_toolsets.api_server` in your Hermes config to a narrowly scoped toolset.
    - This bridge cannot reliably detect injection. The user controls Hermes's authorization model.
 
-3. **Subprocess argument injection.** Mitigated by always passing `argv` as a list and never using `shell=True`. Verified by `tests/test_hermes_client.py`.
+4. **Authorization-code interception.** Mitigated by mandatory PKCE-S256 and the requirement that `client_secret` accompany the code exchange at `/token`. Codes are single-use (atomic pop on exchange), expire in 60 seconds, and `_StaticClient.validate_redirect_uri` enforces a scheme allowlist (`https`, `http` for localhost only, `claude`, `claudeai`) to prevent `/authorize` becoming an open redirector.
 
-4. **DoS via long-running prompts.** Mitigated by `HERMES_TIMEOUT_SECONDS` (default 300s). Tune for your workload.
+5. **Refresh-token replay.** Mitigated by atomic-pop-then-mint rotation: a second concurrent `/token` request with the same refresh token finds it gone and is rejected. This also approximates RFC 6819 reuse detection.
 
-5. **Information disclosure via logs.** Prompt bodies are logged only at `DEBUG`. The default `INFO` level logs only length, `session_id`, and duration. Tunnel access logs (cloudflared / ngrok) may record IP and request volume; they do **not** see decrypted bodies because TLS terminates there but the request body is forwarded to the local server before being logged.
+6. **DoS via unbounded state growth.** `/authorize` is a public endpoint. Mitigated by `MAX_OUTSTANDING_AUTH_CODES` and `MAX_OUTSTANDING_ACCESS_TOKENS` caps with opportunistic reaping of expired entries.
+
+7. **Information disclosure via logs.** Prompt bodies and gateway response bodies are logged only at `DEBUG`. The default `INFO` level logs only `endpoint`, `prompt_chars`, session presence, and timeouts. Token-mint events log only the TTL. The OAuth `state` parameter is sanitized (newlines escaped, truncated) before logging to prevent log injection. Tunnel access logs may record IP and request volume; they do not see request bodies because TLS terminates there before the body is forwarded to the local server.
 
 ### Out of scope for the threat model
 
 - Compromise of the host operating system.
 - Compromise of the cloudflared / ngrok account or their infrastructure.
 - Compromise of the user's Claude account (which would let an attacker into the same chats anyway).
-- Side channels in subprocess execution (CPU timing, memory pressure, etc.).
+- Compromise of the `hermes-gateway` process itself (Scenario E in THREAT_MODEL.md).
 
 ## No telemetry
 

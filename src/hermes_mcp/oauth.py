@@ -30,8 +30,10 @@ from mcp.server.auth.provider import (
     AccessToken,
     AuthorizationCode,
     AuthorizationParams,
+    AuthorizeError,
     OAuthAuthorizationServerProvider,
     RefreshToken,
+    TokenError,
     construct_redirect_uri,
 )
 from mcp.shared.auth import (
@@ -47,20 +49,66 @@ DEFAULT_ACCESS_TOKEN_TTL = 3600  # 1 hour
 DEFAULT_REFRESH_TOKEN_TTL = 30 * 24 * 3600  # 30 days
 AUTHORIZATION_CODE_TTL = 60  # 1 minute (RFC 6749 §4.1.2 recommends short)
 
+# Caps to prevent unbounded growth from drive-by /authorize calls.
+MAX_OUTSTANDING_AUTH_CODES = 1024
+MAX_OUTSTANDING_ACCESS_TOKENS = 4096
+
+# Redirect-URI schemes the bridge will accept. PKCE + client_secret protect
+# the token exchange, but `/authorize` redirects out to whatever URI the
+# request specifies — we should not let that be a `javascript:`, `file:`,
+# or `data:` URL or anything else that would turn this endpoint into an
+# open redirector to dangerous schemes.
+_ALLOWED_REDIRECT_SCHEMES = frozenset(
+    {
+        "https",
+        "http",  # only honored for localhost; see _check_redirect_uri
+        "claude",
+        "claudeai",
+    }
+)
+
+
+def _check_redirect_uri(redirect_uri: AnyUrl) -> None:
+    """Reject schemes/hosts that would turn the OAuth flow into an open
+    redirector to dangerous targets. Permissive within sane bounds — we
+    do not pin specific Claude callback URIs because they are subject to
+    change without notice."""
+    scheme = (redirect_uri.scheme or "").lower()
+    if scheme not in _ALLOWED_REDIRECT_SCHEMES:
+        raise InvalidRedirectUriError(f"redirect_uri scheme {scheme!r} is not allowed")
+    if scheme == "http" and redirect_uri.host not in ("localhost", "127.0.0.1", "::1"):
+        raise InvalidRedirectUriError("redirect_uri scheme 'http' is only allowed for localhost")
+
+
+def _safe_state(state: str | None) -> str:
+    """Sanitize the OAuth `state` value before logging. The client controls
+    state — without sanitization, an attacker hitting `/authorize` could
+    inject log lines via newlines.
+    """
+    if not state:
+        return "(none)"
+    return state.replace("\n", "\\n").replace("\r", "\\r")[:64]
+
 
 class _StaticClient(OAuthClientInformationFull):
-    """Single static client. Accepts any redirect_uri sent by the client.
+    """Single static client. Accepts any redirect_uri sent by the client,
+    subject to a scheme allowlist enforced by `_check_redirect_uri`.
 
-    Validating the redirect_uri against a pre-registered list is not useful
-    here: we have one client whose `client_secret` is required at /token,
-    and we have PKCE binding the code to the original code_challenge. An
-    attacker who substitutes a redirect_uri cannot exchange the code without
-    both secrets.
+    Validating the redirect_uri against a *pre-registered list* is not
+    useful here: we have one client whose `client_secret` is required at
+    /token, and we have PKCE binding the code to the original
+    code_challenge. An attacker who substitutes a redirect_uri cannot
+    exchange the code without both secrets.
+
+    Validating the redirect_uri's *scheme* is, however, useful: without it
+    `/authorize` would happily redirect to `javascript:` or `data:` URIs
+    on request, turning the endpoint into an open redirector.
     """
 
     def validate_redirect_uri(self, redirect_uri: AnyUrl | None) -> AnyUrl:
         if redirect_uri is None:
             raise InvalidRedirectUriError("redirect_uri is required")
+        _check_redirect_uri(redirect_uri)
         return redirect_uri
 
 
@@ -105,6 +153,16 @@ class StaticClientProvider(
     async def authorize(
         self, client: OAuthClientInformationFull, params: AuthorizationParams
     ) -> str:
+        # Reap expired codes opportunistically so `/authorize` is the only
+        # write path that grows the dict.
+        self._reap_expired_codes()
+        if len(self._auth_codes) >= MAX_OUTSTANDING_AUTH_CODES:
+            logger.warning(
+                "oauth: refusing /authorize — outstanding-code cap reached (%d)",
+                MAX_OUTSTANDING_AUTH_CODES,
+            )
+            raise AuthorizeError("server_error", "Too many outstanding authorization codes")
+
         # Auto-approve: mint a code and immediately redirect back to the client.
         code = secrets.token_urlsafe(32)
         self._auth_codes[code] = AuthorizationCode(
@@ -117,7 +175,7 @@ class StaticClientProvider(
             redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
             resource=params.resource,
         )
-        logger.info("oauth: issued authorization code (state=%s)", params.state)
+        logger.info("oauth: issued authorization code (state=%s)", _safe_state(params.state))
         return construct_redirect_uri(
             str(params.redirect_uri),
             code=code,
@@ -132,8 +190,10 @@ class StaticClientProvider(
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
-        # Codes are single-use.
-        self._auth_codes.pop(authorization_code.code, None)
+        # Codes are single-use: pop *atomically* before minting so concurrent
+        # exchanges of the same code can't both succeed.
+        if self._auth_codes.pop(authorization_code.code, None) is None:
+            raise TokenError("invalid_grant", "authorization code was already used")
         return self._mint_token_pair(client, authorization_code.scopes, authorization_code.resource)
 
     async def load_refresh_token(
@@ -153,8 +213,12 @@ class StaticClientProvider(
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        # Rotate both: invalidate the old refresh + access pair before minting new.
-        self._refresh_tokens.pop(refresh_token.token, None)
+        # Atomic pop *before* minting so concurrent /token exchanges of the
+        # same refresh token can't both produce valid pairs. RFC 6819 §5.2.2.3
+        # recommends rotation; this also approximates reuse detection
+        # (second arrival sees the token gone and is rejected as invalid_grant).
+        if self._refresh_tokens.pop(refresh_token.token, None) is None:
+            raise TokenError("invalid_grant", "refresh token was already used")
         old_access = self._refresh_to_access.pop(refresh_token.token, None)
         if old_access:
             self._access_tokens.pop(old_access, None)
@@ -180,12 +244,29 @@ class StaticClientProvider(
             if old_access:
                 self._access_tokens.pop(old_access, None)
 
+    def _reap_expired_codes(self) -> None:
+        now = time.time()
+        expired = [c for c, ac in self._auth_codes.items() if ac.expires_at < now]
+        for c in expired:
+            self._auth_codes.pop(c, None)
+
     def _mint_token_pair(
         self,
         client: OAuthClientInformationFull,
         scopes: list[str],
         resource: str | None,
     ) -> OAuthToken:
+        # Cap outstanding tokens. Under normal operation every token here is
+        # live (Claude refreshes well before expiry); hitting this means
+        # something is wrong (a runaway client) and refusing is the right call.
+        if len(self._access_tokens) >= MAX_OUTSTANDING_ACCESS_TOKENS:
+            self._reap_expired_access_tokens()
+            if len(self._access_tokens) >= MAX_OUTSTANDING_ACCESS_TOKENS:
+                # No perfect TokenErrorCode for "we're out of capacity"; the
+                # closest is invalid_request — RFC 6749 doesn't model rate-limit
+                # in the token-error set.
+                raise TokenError("invalid_request", "Too many outstanding access tokens")
+
         access = secrets.token_urlsafe(32)
         refresh = secrets.token_urlsafe(32)
         now = int(time.time())
@@ -211,6 +292,14 @@ class StaticClientProvider(
             refresh_token=refresh,
             scope=" ".join(scopes) if scopes else None,
         )
+
+    def _reap_expired_access_tokens(self) -> None:
+        now = int(time.time())
+        expired = [
+            t for t, at in self._access_tokens.items() if at.expires_at and at.expires_at < now
+        ]
+        for t in expired:
+            self._access_tokens.pop(t, None)
 
 
 def mint_client_credentials() -> tuple[str, str]:

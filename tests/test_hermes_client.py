@@ -1,97 +1,180 @@
 from __future__ import annotations
 
-import subprocess
-from unittest.mock import patch
-
+import httpx
 import pytest
 
 from hermes_mcp.hermes_client import HermesClient, HermesError
 
 
-def _completed(
-    returncode: int = 0, stdout: str = "ok", stderr: str = ""
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(
-        args=[],
-        returncode=returncode,
-        stdout=stdout,
-        stderr=stderr,
+def _client(timeout: int = 60) -> HermesClient:
+    return HermesClient(
+        api_url="http://127.0.0.1:8642",
+        api_key="k" * 32,
+        model="hermes-agent",
+        timeout_seconds=timeout,
     )
 
 
-def test_argv_stateless_minimal() -> None:
-    client = HermesClient(hermes_bin="/usr/bin/hermes", timeout_seconds=60)
-    argv = client._build_argv("hello", session_id=None, toolsets=None)
-    assert argv == ["/usr/bin/hermes", "-z", "hello"]
+def _ok_response(content: str = "the answer") -> dict[str, object]:
+    return {
+        "id": "chatcmpl-x",
+        "object": "chat.completion",
+        "model": "hermes",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+    }
 
 
-def test_argv_with_session() -> None:
-    client = HermesClient(hermes_bin="hermes", timeout_seconds=60)
-    argv = client._build_argv("hi", session_id="sess-1", toolsets=None)
-    assert argv == ["hermes", "--continue", "sess-1", "-z", "hi"]
+def test_constructor_validates_required_args() -> None:
+    with pytest.raises(ValueError, match="api_url is required"):
+        HermesClient(api_url="", api_key="k", model="m", timeout_seconds=10)
+    with pytest.raises(ValueError, match="api_key is required"):
+        HermesClient(api_url="http://localhost", api_key="", model="m", timeout_seconds=10)
 
 
-def test_argv_with_call_toolsets_overrides_default() -> None:
-    client = HermesClient(
-        hermes_bin="hermes",
-        timeout_seconds=60,
-        default_toolsets=("web",),
+def test_ask_posts_chat_completions(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_post(url: str, **kwargs: object) -> httpx.Response:
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return httpx.Response(200, json=_ok_response("hi from hermes"))
+
+    monkeypatch.setattr("hermes_mcp.hermes_client.httpx.post", fake_post)
+    out = _client().ask("ping")
+    assert out == "hi from hermes"
+    assert captured["url"] == "http://127.0.0.1:8642/v1/chat/completions"
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["json"] == {  # type: ignore[index]
+        "model": "hermes-agent",
+        "messages": [{"role": "user", "content": "ping"}],
+        "stream": False,
+    }
+    assert kwargs["headers"]["Authorization"] == "Bearer " + "k" * 32  # type: ignore[index]
+    assert "X-Hermes-Session-Id" not in kwargs["headers"]  # type: ignore[index]
+
+
+def test_ask_forwards_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_post(url: str, **kwargs: object) -> httpx.Response:
+        captured["kwargs"] = kwargs
+        return httpx.Response(200, json=_ok_response())
+
+    monkeypatch.setattr("hermes_mcp.hermes_client.httpx.post", fake_post)
+    _client().ask("ping", session_id="sess-1")
+    headers = captured["kwargs"]["headers"]  # type: ignore[index]
+    assert headers["X-Hermes-Session-Id"] == "sess-1"
+
+
+def test_ask_strips_whitespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "hermes_mcp.hermes_client.httpx.post",
+        lambda *a, **kw: httpx.Response(200, json=_ok_response("  spaced out  \n")),
     )
-    argv = client._build_argv("hi", session_id=None, toolsets=["filesystem", "email"])
-    assert argv == ["hermes", "-t", "filesystem,email", "-z", "hi"]
+    assert _client().ask("ping") == "spaced out"
 
 
-def test_argv_uses_default_toolsets() -> None:
-    client = HermesClient(
-        hermes_bin="hermes",
-        timeout_seconds=60,
-        default_toolsets=("web", "fs"),
+def test_ask_translates_401_to_actionable_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "hermes_mcp.hermes_client.httpx.post",
+        lambda *a, **kw: httpx.Response(401, text="unauthorized"),
     )
-    argv = client._build_argv("hi", session_id=None, toolsets=None)
-    assert argv == ["hermes", "-t", "web,fs", "-z", "hi"]
+    with pytest.raises(HermesError, match="rejected the API key"):
+        _client().ask("ping")
 
 
-def test_argv_empty_call_toolsets_means_no_flag() -> None:
-    client = HermesClient(
-        hermes_bin="hermes",
-        timeout_seconds=60,
-        default_toolsets=("web",),
+def test_ask_propagates_non_200(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "hermes_mcp.hermes_client.httpx.post",
+        lambda *a, **kw: httpx.Response(500, text="boom"),
     )
-    argv = client._build_argv("hi", session_id=None, toolsets=[])
-    assert argv == ["hermes", "-z", "hi"]
+    with pytest.raises(HermesError, match="returned HTTP 500"):
+        _client().ask("ping")
 
 
-def test_ask_returns_stripped_stdout() -> None:
-    client = HermesClient(hermes_bin="hermes", timeout_seconds=60)
-    with patch("hermes_mcp.hermes_client.subprocess.run") as run:
-        run.return_value = _completed(stdout="  hermes says hi  \n")
-        out = client.ask("ping")
-    assert out == "hermes says hi"
-    args, kwargs = run.call_args
-    assert kwargs["timeout"] == 60
-    assert kwargs.get("shell", False) is False
-    assert args[0] == ["hermes", "-z", "ping"]
+def test_ask_translates_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_a: object, **_kw: object) -> httpx.Response:
+        raise httpx.ConnectTimeout("slow")
+
+    monkeypatch.setattr("hermes_mcp.hermes_client.httpx.post", boom)
+    with pytest.raises(HermesError, match="timed out after"):
+        _client().ask("ping")
 
 
-def test_ask_propagates_nonzero_exit() -> None:
-    client = HermesClient(hermes_bin="hermes", timeout_seconds=60)
-    with patch("hermes_mcp.hermes_client.subprocess.run") as run:
-        run.return_value = _completed(returncode=2, stderr="boom")
-        with pytest.raises(HermesError, match="hermes exited 2"):
-            client.ask("ping")
+def test_ask_translates_transport_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_a: object, **_kw: object) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr("hermes_mcp.hermes_client.httpx.post", boom)
+    with pytest.raises(HermesError, match="request failed"):
+        _client().ask("ping")
 
 
-def test_ask_propagates_timeout() -> None:
-    client = HermesClient(hermes_bin="hermes", timeout_seconds=1)
-    with patch("hermes_mcp.hermes_client.subprocess.run") as run:
-        run.side_effect = subprocess.TimeoutExpired(cmd="hermes", timeout=1)
-        with pytest.raises(HermesError, match="timed out"):
-            client.ask("ping")
+def test_ask_handles_malformed_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "hermes_mcp.hermes_client.httpx.post",
+        lambda *a, **kw: httpx.Response(200, json={"choices": []}),
+    )
+    with pytest.raises(HermesError, match="malformed"):
+        _client().ask("ping")
 
 
-def test_ask_propagates_oserror() -> None:
-    client = HermesClient(hermes_bin="hermes-missing", timeout_seconds=60)
-    with patch("hermes_mcp.hermes_client.subprocess.run") as run:
-        run.side_effect = FileNotFoundError("no such file")
-        with pytest.raises(HermesError, match="failed to invoke hermes"):
-            client.ask("ping")
+def test_ask_rejects_non_string_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Some OpenAI-compatible servers return content as a list of segments;
+    we don't try to flatten — fail fast so the operator notices."""
+
+    def fake_post(*_a: object, **_kw: object) -> httpx.Response:
+        body = {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}]},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        return httpx.Response(200, json=body)
+
+    monkeypatch.setattr("hermes_mcp.hermes_client.httpx.post", fake_post)
+    with pytest.raises(HermesError, match="content was list"):
+        _client().ask("ping")
+
+
+def test_ask_does_not_echo_response_body_in_user_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A misbehaving gateway must not be able to inject content into the
+    user-visible error string. Body lands in DEBUG only."""
+    secret_marker = "GATEWAY_RESPONSE_BODY_SHOULD_NOT_LEAK"
+    monkeypatch.setattr(
+        "hermes_mcp.hermes_client.httpx.post",
+        lambda *a, **kw: httpx.Response(500, text=secret_marker),
+    )
+    try:
+        _client().ask("ping")
+    except HermesError as exc:
+        assert secret_marker not in str(exc)
+    else:
+        raise AssertionError("expected HermesError")
+
+
+def test_ask_does_not_log_prompt_at_info(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Privacy invariant: prompt body never appears in INFO logs."""
+    monkeypatch.setattr(
+        "hermes_mcp.hermes_client.httpx.post",
+        lambda *a, **kw: httpx.Response(200, json=_ok_response()),
+    )
+    with caplog.at_level("INFO", logger="hermes_mcp.hermes_client"):
+        _client().ask("VERY-PRIVATE-PROMPT-CONTENT-XYZ")
+    for rec in caplog.records:
+        assert "VERY-PRIVATE-PROMPT-CONTENT-XYZ" not in rec.message

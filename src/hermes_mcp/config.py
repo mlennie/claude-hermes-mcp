@@ -1,7 +1,8 @@
 """Environment-variable configuration for hermes-mcp.
 
 All knobs documented in `.env.example`. The server refuses to start if any
-of OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, or OAUTH_ISSUER_URL is missing.
+of OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, OAUTH_ISSUER_URL, or HERMES_API_KEY
+is missing.
 """
 
 from __future__ import annotations
@@ -25,11 +26,12 @@ class Config:
     oauth_client_id: str
     oauth_client_secret: str
     oauth_issuer_url: str
-    hermes_bin: str
+    hermes_api_url: str
+    hermes_api_key: str
+    hermes_model: str
+    hermes_request_timeout_seconds: int
     bind_host: str
     bind_port: int
-    hermes_timeout_seconds: int
-    hermes_toolsets: tuple[str, ...]
     allowed_hosts: tuple[str, ...]
     log_level: LogLevel
 
@@ -62,6 +64,19 @@ class Config:
                 f"OAUTH_ISSUER_URL must be HTTPS (or http://localhost for testing), got {issuer_url}"
             )
 
+        hermes_api_url = (e.get("HERMES_API_URL") or "http://127.0.0.1:8642").strip().rstrip("/")
+        if not (hermes_api_url.startswith("http://") or hermes_api_url.startswith("https://")):
+            raise ConfigError(f"HERMES_API_URL must be http:// or https://, got {hermes_api_url}")
+
+        hermes_api_key = (e.get("HERMES_API_KEY") or "").strip()
+        if not hermes_api_key:
+            raise ConfigError(
+                "HERMES_API_KEY is required (the bearer token for the Hermes gateway "
+                "OpenAI-compatible API; check ~/.hermes/.env for API_SERVER_KEY)."
+            )
+
+        hermes_model = (e.get("HERMES_MODEL") or "hermes-agent").strip()
+
         try:
             port = int(e.get("BIND_PORT", "8765"))
         except ValueError as exc:
@@ -70,16 +85,16 @@ class Config:
             raise ConfigError(f"BIND_PORT must be in 1..65535, got {port}")
 
         try:
-            timeout = int(e.get("HERMES_TIMEOUT_SECONDS", "300"))
+            request_timeout = int(e.get("HERMES_REQUEST_TIMEOUT_SECONDS", "300"))
         except ValueError as exc:
             raise ConfigError(
-                f"HERMES_TIMEOUT_SECONDS must be an integer, got {e.get('HERMES_TIMEOUT_SECONDS')!r}"
+                "HERMES_REQUEST_TIMEOUT_SECONDS must be an integer, got "
+                f"{e.get('HERMES_REQUEST_TIMEOUT_SECONDS')!r}"
             ) from exc
-        if timeout <= 0:
-            raise ConfigError(f"HERMES_TIMEOUT_SECONDS must be positive, got {timeout}")
-
-        toolsets_raw = (e.get("HERMES_TOOLSETS") or "").strip()
-        toolsets = tuple(t.strip() for t in toolsets_raw.split(",") if t.strip())
+        if request_timeout <= 0:
+            raise ConfigError(
+                f"HERMES_REQUEST_TIMEOUT_SECONDS must be positive, got {request_timeout}"
+            )
 
         allowed_hosts_raw = (e.get("MCP_ALLOWED_HOSTS") or "").strip()
         allowed_hosts = tuple(h.strip() for h in allowed_hosts_raw.split(",") if h.strip())
@@ -91,15 +106,26 @@ class Config:
             )
         log_level: LogLevel = log_level_raw  # type: ignore[assignment]
 
+        bind_host = (e.get("BIND_HOST") or "127.0.0.1").strip()
+        if bind_host not in ("127.0.0.1", "::1", "localhost"):
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "BIND_HOST=%r is not loopback. The bridge expects a tunnel "
+                "to reach it on localhost; binding elsewhere exposes the "
+                "OAuth and tool endpoints to anyone who can reach this host.",
+                bind_host,
+            )
+
         return cls(
             oauth_client_id=client_id,
             oauth_client_secret=client_secret,
             oauth_issuer_url=issuer_url,
-            hermes_bin=(e.get("HERMES_BIN") or "hermes").strip(),
-            bind_host=(e.get("BIND_HOST") or "127.0.0.1").strip(),
+            hermes_api_url=hermes_api_url,
+            hermes_api_key=hermes_api_key,
+            hermes_model=hermes_model,
+            hermes_request_timeout_seconds=request_timeout,
+            bind_host=bind_host,
             bind_port=port,
-            hermes_timeout_seconds=timeout,
-            hermes_toolsets=toolsets,
             allowed_hosts=allowed_hosts,
             log_level=log_level,
         )

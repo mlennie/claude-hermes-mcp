@@ -1,112 +1,123 @@
-"""Subprocess wrapper for the hermes CLI.
+"""HTTP client for the Hermes Agent gateway's OpenAI-compatible chat API.
 
-This module is the **only** place that knows the hermes CLI flag surface.
-We invoke hermes via its public CLI (`hermes -z`, `hermes --continue`,
-`hermes --toolsets`) and never import private hermes Python modules — the
-CLI is the stable contract across hermes versions.
+Each `hermes_ask` call becomes a `POST /v1/chat/completions` to the running
+hermes-gateway (default `http://127.0.0.1:8642`). The gateway runs the same
+`AIAgent.run_conversation` loop that drives Telegram, so Claude — talking
+through this bridge — gets the same brain (skills, sessions, tool
+execution) Hermes already has loaded.
 
 Security:
-  - argv is always a list; `shell=True` is never used.
-  - timeout is enforced.
-  - prompt bodies are NOT logged at INFO level (privacy by default).
+  - HTTPS-or-localhost; the gateway is bound to 127.0.0.1 by default.
+  - Bearer auth via `API_SERVER_KEY` (configured here as `HERMES_API_KEY`).
+  - Prompt bodies are NOT logged at INFO level (privacy by default).
+  - Gateway response bodies are NOT echoed in user-visible errors.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import subprocess
-from collections.abc import Sequence
-from dataclasses import dataclass
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
 
 class HermesError(Exception):
-    """Raised when a hermes invocation fails."""
-
-
-@dataclass(frozen=True)
-class HermesResult:
-    stdout: str
-    stderr: str
-    returncode: int
+    """Raised when a hermes gateway call fails."""
 
 
 class HermesClient:
-    """Invokes the hermes CLI in one-shot mode."""
+    """Calls the gateway's `/v1/chat/completions` endpoint."""
 
     def __init__(
         self,
-        hermes_bin: str,
+        api_url: str,
+        api_key: str,
+        model: str,
         timeout_seconds: int,
-        default_toolsets: Sequence[str] = (),
     ) -> None:
-        self._bin = hermes_bin
+        if not api_url:
+            raise ValueError("api_url is required")
+        if not api_key:
+            raise ValueError("api_key is required")
+        self._endpoint = api_url.rstrip("/") + "/v1/chat/completions"
+        self._api_key = api_key
+        self._model = model
         self._timeout = timeout_seconds
-        self._default_toolsets = tuple(default_toolsets)
 
     def ask(
         self,
         prompt: str,
         session_id: str | None = None,
-        toolsets: Sequence[str] | None = None,
+        toolsets: list[str] | None = None,
     ) -> str:
-        """Send `prompt` to hermes and return its final response text.
+        """Send `prompt` to the gateway and return its final response text.
 
-        If `session_id` is provided, hermes continues that session
-        (`hermes --continue <id>`). Otherwise a fresh one-shot invocation.
+        If `session_id` is provided, it is forwarded as `X-Hermes-Session-Id`
+        so the gateway threads the call into an existing session.
+
+        `toolsets` is accepted for backward-compat but ignored — toolset
+        selection now lives in Hermes config (`platform_toolsets.api_server`).
         """
-        argv = self._build_argv(prompt, session_id=session_id, toolsets=toolsets)
-        result = self._run(argv)
-        return result.stdout.strip()
+        del toolsets
 
-    def _build_argv(
-        self,
-        prompt: str,
-        session_id: str | None,
-        toolsets: Sequence[str] | None,
-    ) -> list[str]:
-        argv: list[str] = [self._bin]
-
-        effective_toolsets = tuple(toolsets) if toolsets is not None else self._default_toolsets
-        if effective_toolsets:
-            argv.extend(["-t", ",".join(effective_toolsets)])
-
+        body = {
+            "model": self._model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
         if session_id:
-            argv.extend(["--continue", session_id])
+            headers["X-Hermes-Session-Id"] = session_id
 
-        argv.extend(["-z", prompt])
-        return argv
-
-    def _run(self, argv: list[str]) -> HermesResult:
         logger.info(
-            "hermes invoke argc=%d session=%s timeout=%ds",
-            len(argv),
-            "y" if "--continue" in argv else "n",
+            "hermes invoke endpoint=%s prompt_chars=%d session=%s timeout=%ds",
+            self._endpoint,
+            len(prompt),
+            "y" if session_id else "n",
             self._timeout,
         )
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("hermes argv: %s", argv)
+            logger.debug("hermes request body: %s", body)
 
         try:
-            completed = subprocess.run(  # noqa: S603 — argv list, shell=False
-                argv,
-                capture_output=True,
-                text=True,
+            response = httpx.post(
+                self._endpoint,
+                json=body,
+                headers=headers,
                 timeout=self._timeout,
-                check=False,
+                follow_redirects=False,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise HermesError(f"hermes timed out after {self._timeout}s") from exc
-        except OSError as exc:
-            raise HermesError(f"failed to invoke hermes ({argv[0]}): {exc}") from exc
+        except httpx.TimeoutException as exc:
+            raise HermesError(f"hermes gateway timed out after {self._timeout}s") from exc
+        except httpx.HTTPError as exc:
+            raise HermesError(f"hermes gateway request failed: {exc}") from exc
 
-        if completed.returncode != 0:
-            tail = (completed.stderr or "").strip()[-500:]
-            raise HermesError(f"hermes exited {completed.returncode}: {tail}")
+        if response.status_code == 401:
+            raise HermesError(
+                "hermes gateway rejected the API key (401). "
+                "Check HERMES_API_KEY matches API_SERVER_KEY in ~/.hermes/.env."
+            )
+        if response.status_code != 200:
+            # Don't echo the body — a misbehaving gateway could put sensitive
+            # content (or attacker-controlled bytes) there. Body lands in DEBUG.
+            logger.debug("hermes gateway error body: %s", response.text[:1000])
+            raise HermesError(
+                f"hermes gateway returned HTTP {response.status_code}; "
+                "see DEBUG logs for the response body."
+            )
 
-        return HermesResult(
-            stdout=completed.stdout or "",
-            stderr=completed.stderr or "",
-            returncode=completed.returncode,
-        )
+        try:
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+            raise HermesError(f"hermes gateway returned malformed response: {exc}") from exc
+
+        if not isinstance(content, str):
+            raise HermesError(f"hermes gateway response.content was {type(content).__name__}")
+
+        return content.strip()

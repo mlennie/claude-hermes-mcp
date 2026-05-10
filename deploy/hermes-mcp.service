@@ -1,20 +1,36 @@
 [Unit]
-Description=Hermes MCP Bridge
+Description=Hermes MCP Bridge - OAuth gate in front of the local Hermes Agent
 Documentation=https://github.com/mlennie/claude-hermes-mcp
-After=network-online.target
+After=network-online.target hermes-gateway.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=clawone
-# Create /etc/hermes-mcp.env (mode 0600) with your env vars — see .env.example
-EnvironmentFile=/etc/hermes-mcp.env
-ExecStart=/home/clawone/.local/bin/hermes-mcp serve
+# Install as a systemd --user unit at ~/.config/systemd/user/hermes-mcp.service
+# Env file (mode 0600) must contain OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET,
+# OAUTH_ISSUER_URL, MCP_ALLOWED_HOSTS, HERMES_API_KEY — see .env.example
+EnvironmentFile=%h/.config/hermes-mcp/env
+ExecStart=%h/.local/bin/hermes-mcp serve
 Restart=on-failure
 RestartSec=5
-# Prevent the process from writing to /tmp or gaining new privileges
-PrivateTmp=true
+
+# Hardening (defense in depth)
 NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/hermes-mcp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

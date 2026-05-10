@@ -78,12 +78,41 @@ def test_authorize_returns_redirect_with_code_and_state() -> None:
     assert "state=st-1" in redirect
 
 
-def test_validate_redirect_uri_permissive() -> None:
+def test_validate_redirect_uri_allows_expected_schemes() -> None:
     p = _provider()
     client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
-    # Any URI works for the static client (security via PKCE + client_secret).
+    # Public-suffix HTTPS URLs.
+    assert client.validate_redirect_uri(AnyUrl("https://app.example.com/cb")) is not None
+    # Claude Desktop's private-use schemes.
     assert client.validate_redirect_uri(AnyUrl("claude://oauth/callback")) is not None
+    assert client.validate_redirect_uri(AnyUrl("claudeai://oauth/callback")) is not None
+    # http only on localhost.
     assert client.validate_redirect_uri(AnyUrl("http://localhost:9999/x")) is not None
+    assert client.validate_redirect_uri(AnyUrl("http://127.0.0.1:9999/x")) is not None
+
+
+def test_validate_redirect_uri_rejects_dangerous_schemes() -> None:
+    """The /authorize redirect must not become an open redirector to javascript:
+    or data: URIs even though PKCE + client_secret protect token exchange."""
+    p = _provider()
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    for evil in (
+        "javascript:alert(1)",
+        "data:text/html,<script>alert(1)</script>",
+        "file:///etc/passwd",
+        "ftp://example.com/x",
+    ):
+        with pytest.raises(InvalidRedirectUriError, match="not allowed"):
+            client.validate_redirect_uri(AnyUrl(evil))
+
+
+def test_validate_redirect_uri_rejects_http_to_remote_host() -> None:
+    """http:// is allowed only for localhost — preserves loopback testing
+    without exposing the bridge to plaintext phishing redirects."""
+    p = _provider()
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    with pytest.raises(InvalidRedirectUriError, match="only allowed for localhost"):
+        client.validate_redirect_uri(AnyUrl("http://evil.example.com/cb"))
 
 
 def test_validate_redirect_uri_rejects_none() -> None:
@@ -135,15 +164,18 @@ def test_access_token_verifiable_via_load_access_token() -> None:
 
 
 def test_expired_access_token_rejected() -> None:
-    p = _provider(access_token_ttl=1)
+    p = _provider()
     client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
     redirect = asyncio.run(p.authorize(client, _params()))
     code = redirect.split("code=")[1].split("&")[0]
     auth_code = cast(AuthorizationCode, asyncio.run(p.load_authorization_code(client, code)))
     tokens = asyncio.run(p.exchange_authorization_code(client, auth_code))
 
-    # int(time.time()) granularity — sleep past the next integer second.
-    time.sleep(2.1)
+    # Backdate the stored expiry past now without sleeping (fast + deterministic).
+    stored = p._access_tokens[tokens.access_token]
+    p._access_tokens[tokens.access_token] = stored.model_copy(
+        update={"expires_at": int(time.time()) - 1}
+    )
     assert asyncio.run(p.load_access_token(tokens.access_token)) is None
 
 
@@ -198,3 +230,130 @@ def test_revoke_token_clears_storage() -> None:
     assert access is not None
     asyncio.run(p.revoke_token(access))  # type: ignore[arg-type]
     assert asyncio.run(p.load_access_token(tokens.access_token)) is None
+
+
+def test_authorization_code_reuse_rejected() -> None:
+    """A second exchange of the same code must fail. The fix is atomic
+    pop-then-mint, not the prior post-mint pop."""
+    p = _provider()
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    redirect = asyncio.run(p.authorize(client, _params()))
+    code = redirect.split("code=")[1].split("&")[0]
+    auth_code = cast(AuthorizationCode, asyncio.run(p.load_authorization_code(client, code)))
+    asyncio.run(p.exchange_authorization_code(client, auth_code))
+
+    # Replay attempt — code is gone from storage.
+    from mcp.server.auth.provider import TokenError as _TokenError
+
+    with pytest.raises(_TokenError, match="already used"):
+        asyncio.run(p.exchange_authorization_code(client, auth_code))
+
+
+def test_refresh_token_reuse_rejected() -> None:
+    """Concurrent /token requests with the same refresh token: only one wins."""
+    p = _provider()
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    redirect = asyncio.run(p.authorize(client, _params()))
+    code = redirect.split("code=")[1].split("&")[0]
+    auth_code = cast(AuthorizationCode, asyncio.run(p.load_authorization_code(client, code)))
+    tokens = asyncio.run(p.exchange_authorization_code(client, auth_code))
+    rt = cast(object, asyncio.run(p.load_refresh_token(client, tokens.refresh_token or "")))
+    assert rt is not None
+
+    # First refresh succeeds, mints new pair.
+    asyncio.run(p.exchange_refresh_token(client, rt, []))  # type: ignore[arg-type]
+
+    # Second refresh with the same RT must fail (atomic pop already removed it).
+    from mcp.server.auth.provider import TokenError as _TokenError
+
+    with pytest.raises(_TokenError, match="already used"):
+        asyncio.run(p.exchange_refresh_token(client, rt, []))  # type: ignore[arg-type]
+
+
+def test_expired_refresh_token_rejected() -> None:
+    p = _provider()
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    redirect = asyncio.run(p.authorize(client, _params()))
+    code = redirect.split("code=")[1].split("&")[0]
+    auth_code = cast(AuthorizationCode, asyncio.run(p.load_authorization_code(client, code)))
+    tokens = asyncio.run(p.exchange_authorization_code(client, auth_code))
+
+    # Backdate the refresh-token expiry past now without sleeping.
+    rt_token = tokens.refresh_token or ""
+    stored = p._refresh_tokens[rt_token]
+    p._refresh_tokens[rt_token] = stored.model_copy(update={"expires_at": int(time.time()) - 1})
+
+    assert asyncio.run(p.load_refresh_token(client, rt_token)) is None
+
+
+def test_authorize_caps_outstanding_codes() -> None:
+    """A drive-by attacker can't grow _auth_codes unboundedly."""
+    from mcp.server.auth.provider import AuthorizeError
+
+    from hermes_mcp.oauth import MAX_OUTSTANDING_AUTH_CODES
+
+    p = _provider()
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    # Pre-fill to the cap with codes that won't reap (expires_at far in future).
+    far_future = time.time() + 10_000
+    for i in range(MAX_OUTSTANDING_AUTH_CODES):
+        p._auth_codes[f"code-{i}"] = AuthorizationCode(
+            code=f"code-{i}",
+            scopes=[],
+            expires_at=far_future,
+            client_id=CLIENT_ID,
+            code_challenge="x",
+            redirect_uri=AnyUrl("https://app.example.com/cb"),
+            redirect_uri_provided_explicitly=True,
+            resource=None,
+        )
+    with pytest.raises(AuthorizeError, match="Too many"):
+        asyncio.run(p.authorize(client, _params()))
+
+
+def test_authorize_reaps_expired_codes_before_capping() -> None:
+    p = _provider()
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    # Pre-fill with already-expired codes; the next authorize() should reap and accept.
+    long_ago = time.time() - 120
+    for i in range(100):
+        p._auth_codes[f"old-{i}"] = AuthorizationCode(
+            code=f"old-{i}",
+            scopes=[],
+            expires_at=long_ago,
+            client_id=CLIENT_ID,
+            code_challenge="x",
+            redirect_uri=AnyUrl("https://app.example.com/cb"),
+            redirect_uri_provided_explicitly=True,
+            resource=None,
+        )
+    redirect = asyncio.run(p.authorize(client, _params()))
+    assert "code=" in redirect
+    # After authorize: the 100 expired entries are gone, only the new code remains.
+    remaining_old = [c for c in p._auth_codes if c.startswith("old-")]
+    assert remaining_old == []
+
+
+def test_state_with_newline_is_sanitized_in_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Attacker-controlled `state` must not inject newlines into log lines."""
+    p = _provider()
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    with caplog.at_level("INFO", logger="hermes_mcp.oauth"):
+        asyncio.run(p.authorize(client, _params(state="evil\nFAKE LOG LINE: pwned")))
+    msgs = [r.message for r in caplog.records if "issued authorization code" in r.message]
+    assert msgs, "expected an issued-authorization-code log line"
+    for m in msgs:
+        # Newlines must be escaped before logging; the raw \n must not appear.
+        assert "\n" not in m
+        assert "FAKE LOG LINE" not in m or "\\n" in m
+
+
+def test_ask_doc_is_not_lost_to_del() -> None:
+    """Regression test: a prior version of hermes_client.ask put `del toolsets`
+    above the docstring, which silently turned __doc__ into None."""
+    from hermes_mcp.hermes_client import HermesClient as _HC
+
+    assert _HC.ask.__doc__ is not None
+    assert "session_id" in _HC.ask.__doc__

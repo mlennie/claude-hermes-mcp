@@ -9,7 +9,7 @@ Use Claude as your daily chat. When you ask for something Hermes is built for �
 │ Claude Desktop       │     │ Claude Android / iOS   │
 │ (laptop)             │     │ (phone)                │
 └──────────┬───────────┘     └──────────┬─────────────┘
-           │ HTTPS (Custom Connector + Bearer)         │
+           │ HTTPS (Custom Connector + OAuth 2.1)      │
            └────────────────┬──────────────────────────┘
                             ▼
                 ┌──────────────────────┐
@@ -19,39 +19,49 @@ Use Claude as your daily chat. When you ask for something Hermes is built for �
                            ▼ localhost:8765
                 ┌──────────────────────┐
                 │ hermes-mcp           │  (FastMCP, Streamable HTTP)
-                │ - bearer auth        │
-                │ - subprocess wrapper │
+                │ - OAuth 2.1 + PKCE   │
+                │ - HTTP -> gateway    │
                 └──────────┬───────────┘
-                           │ subprocess
-                           ▼
+                           │ HTTP /v1/chat/completions
+                           ▼ localhost:8642
                 ┌──────────────────────┐
-                │ hermes -z / --continue│  (CLI surface only)
+                │ hermes-gateway       │  (the running Hermes brain;
+                │                      │   same agent loop Telegram uses)
                 └──────────────────────┘
 ```
 
 ## Quickstart
 
-These steps assume you already have **Hermes Agent** installed and working on a Linux/WSL machine, and that the same machine is reachable on the public internet via [`cloudflared`](#network-exposure-cloudflared) (recommended) or [`ngrok`](#alternative-tunnel-ngrok).
+These steps assume you already have **Hermes Agent** installed and working on a Linux/WSL machine, with the gateway listening on `127.0.0.1:8642`.
 
 ```bash
 # 1. Install
 pipx install hermes-mcp
 
-# 2. Mint OAuth client credentials and set OAUTH_ISSUER_URL to your tunnel URL
-hermes-mcp mint-client                              # prints OAUTH_CLIENT_ID + SECRET
-export OAUTH_CLIENT_ID=<from above>
-export OAUTH_CLIENT_SECRET=<from above>
-export OAUTH_ISSUER_URL=https://hermes.your-domain.example
-export MCP_ALLOWED_HOSTS=hermes.your-domain.example
+# 2. Mint OAuth client credentials
+hermes-mcp mint-client                  # prints OAUTH_CLIENT_ID + OAUTH_CLIENT_SECRET
 
-# 3. Verify everything is wired up
+# 3. Start a quick tunnel (testing only — URL changes on restart)
+cloudflared tunnel --url http://127.0.0.1:8765
+# prints: https://random-words-here.trycloudflare.com
+
+# 4. Export env vars (using the URL from step 3)
+export OAUTH_CLIENT_ID=<from step 2>
+export OAUTH_CLIENT_SECRET=<from step 2>
+export OAUTH_ISSUER_URL=https://random-words-here.trycloudflare.com
+export MCP_ALLOWED_HOSTS=random-words-here.trycloudflare.com
+export HERMES_API_KEY=<the API_SERVER_KEY from ~/.hermes/.env>
+
+# 5. Verify everything is wired up
 hermes-mcp doctor
 
-# 4. Run
+# 6. Run
 hermes-mcp serve
 ```
 
-In another terminal, expose `127.0.0.1:8765` over HTTPS via cloudflared (see below). Then in Claude Desktop or the Claude mobile app, **add a Custom Connector** pointing at `<tunnel-url>/mcp` and paste your `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET`. Claude completes the OAuth flow on its own. You're done.
+In Claude Desktop (or the mobile app), **Settings → Connectors → Add custom connector** → paste `<tunnel-url>/mcp`, then your `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET`. Claude completes the OAuth flow itself.
+
+Once you've confirmed it works end-to-end, follow the [named tunnel](#named-tunnel-for-keeping-it) and [systemd](#running-as-a-service-on-the-mini-pc) sections to make it permanent.
 
 Try asking: *"Use Hermes to schedule a daily cron job that emails me a summary of my inbox at 8am."*
 
@@ -66,12 +76,13 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 | `OAUTH_CLIENT_ID` | **yes** | — | Static OAuth 2.1 client ID. Generate with `hermes-mcp mint-client`. |
 | `OAUTH_CLIENT_SECRET` | **yes** | — | Static OAuth 2.1 client secret (≥32 chars). Generate with `hermes-mcp mint-client`. |
 | `OAUTH_ISSUER_URL` | **yes** | — | Public HTTPS URL where the server is reachable (your tunnel hostname). |
+| `HERMES_API_KEY` | **yes** | — | Bearer token for the local Hermes gateway's OpenAI-compatible API (the `API_SERVER_KEY` from `~/.hermes/.env`). |
+| `HERMES_API_URL` | no | `http://127.0.0.1:8642` | Base URL of the running Hermes gateway. |
+| `HERMES_MODEL` | no | `hermes-agent` | Model identifier sent to `/v1/chat/completions`. |
 | `MCP_ALLOWED_HOSTS` | no | (localhost only) | Comma-separated additional Host header values to accept (typically your public tunnel hostname). MCP uses this for DNS-rebinding protection. |
-| `HERMES_BIN` | no | `hermes` (PATH) | Absolute path to hermes binary if not on PATH. |
 | `BIND_HOST` | no | `127.0.0.1` | Bind address. The tunnel reaches it on localhost. **Do not** bind `0.0.0.0` unless you understand the implications. |
 | `BIND_PORT` | no | `8765` | Port. |
-| `HERMES_TIMEOUT_SECONDS` | no | `300` | Max wall-clock per `hermes_ask` call. |
-| `HERMES_TOOLSETS` | no | (Hermes default) | Comma-separated toolsets to restrict each call. |
+| `HERMES_REQUEST_TIMEOUT_SECONDS` | no | `300` | Max wall-clock per `hermes_ask` call. |
 | `LOG_LEVEL` | no | `INFO` | `DEBUG` enables prompt-body logging. |
 
 ## What Claude sees
@@ -89,42 +100,84 @@ Delegates a task to Hermes. Use it for anything Claude cannot do directly:
 - Anything that should persist after this chat ends (Hermes memory, skills)
 - Sending WhatsApp / Slack messages via Hermes's messaging gateway
 
-Pass the same `session_id` across calls within one Claude chat to let Hermes build on previous steps (draft → refine → save).
+Pass the same `session_id` across calls within one Claude chat to let Hermes build on previous steps (draft → refine → save). It is forwarded as the `X-Hermes-Session-Id` header so Hermes threads the call into an existing session.
+
+The `toolsets` argument is accepted for backward compatibility but is currently ignored — toolset selection now lives in your Hermes config (`platform_toolsets.api_server`). Set it there to match the Telegram surface (typically `[hermes-telegram]`) so Claude gets the same tools the Telegram path does.
 
 ## Network exposure: `cloudflared`
 
-Recommended path. Free, open-source agent, no bandwidth cap that matters at personal scale.
+Recommended. Free, open-source, no bandwidth cap that matters at personal scale.
+
+There are two flavors. Use the **quick tunnel** to test today; use the **named tunnel** for any setup you want to leave running.
+
+### Quick tunnel (for testing)
+
+Throwaway URL, no Cloudflare account needed, dies on `cloudflared` restart. Perfect for the first end-to-end test.
 
 ```bash
 # 1. Install cloudflared
 sudo apt install cloudflared        # or download from cloudflare.com
 
-# 2. Authorize against your Cloudflare account
+# 2. Run a quick tunnel pointed at the local bridge
+cloudflared tunnel --url http://127.0.0.1:8765
+```
+
+`cloudflared` prints a URL like `https://random-words-here.trycloudflare.com`. That's your tunnel for as long as the process runs. Use it as the connector URL in Claude:
+
+```
+Connector URL:  https://random-words-here.trycloudflare.com/mcp
+Client ID:      <from `hermes-mcp mint-client`>
+Client Secret:  <from `hermes-mcp mint-client`>
+```
+
+Set `OAUTH_ISSUER_URL` to `https://random-words-here.trycloudflare.com` and add the hostname to `MCP_ALLOWED_HOSTS` so MCP's DNS-rebinding check accepts it.
+
+⚠ Quick tunnels are ephemeral. The hostname changes every restart — Claude's connector breaks every time. Move to a named tunnel as soon as you're past the smoke test.
+
+### Named tunnel (for keeping it)
+
+Stable hostname on a Cloudflare-managed domain. Survives reboots.
+
+**Prerequisite:** a domain on Cloudflare DNS. Easiest is registering one through [Cloudflare Registrar](https://dash.cloudflare.com/?to=/:account/domains/register) (~$10/yr, sold at cost). If you already have a domain elsewhere, change its nameservers at the registrar to the two Cloudflare gives you, wait for the zone to go Active, then continue. **Don't** put your primary domain on Cloudflare DNS without first auditing email/Workspace records — you'll need to verify Cloudflare's auto-import covers MX, SPF, DKIM, and DMARC before changing nameservers. Buying a separate cheap domain just for the tunnel is the boring safe move.
+
+```bash
+# 1. Authorize this machine on your Cloudflare account (interactive: opens a URL)
 cloudflared tunnel login
 
-# 3. Create a named tunnel
-cloudflared tunnel create hermes-mcp
+# 2. Create the tunnel — pick any name, e.g. "hermes"
+cloudflared tunnel create hermes
 
-# 4. Add a DNS route (requires any domain on Cloudflare DNS — free)
-cloudflared tunnel route dns hermes-mcp hermes.your-domain.example
+# 3. Route a DNS hostname to it (requires the domain be on Cloudflare DNS)
+cloudflared tunnel route dns hermes hermes.your-domain.example
 
-# 5. Configure ~/.cloudflared/config.yml
+# 4. Configure ~/.cloudflared/config.yml
 cat > ~/.cloudflared/config.yml <<EOF
-tunnel: <UUID-from-step-3>
-credentials-file: /home/$USER/.cloudflared/<UUID>.json
+tunnel: <UUID-from-step-2>
+credentials-file: $HOME/.cloudflared/<UUID-from-step-2>.json
 ingress:
   - hostname: hermes.your-domain.example
     service: http://127.0.0.1:8765
   - service: http_status:404
 EOF
 
-# 6. Run it
-cloudflared tunnel run hermes-mcp
+# 5. Test it
+cloudflared tunnel run hermes
+# In another terminal:
+#   curl -sS https://hermes.your-domain.example/.well-known/oauth-authorization-server
+#   ⇒ should print the OAuth metadata JSON
 ```
 
-Your stable HTTPS URL is now `https://hermes.your-domain.example`. Paste it (and the bearer token) into Claude as a Custom Connector.
+Your stable URL is now `https://hermes.your-domain.example`. Update Claude's connector to `<URL>/mcp`, set `OAUTH_ISSUER_URL` to the URL, and add `hermes.your-domain.example` to `MCP_ALLOWED_HOSTS`.
 
-A systemd unit is provided in [`deploy/cloudflared.service`](deploy/cloudflared.service).
+Run cloudflared as a systemd user service — see [`deploy/cloudflared.service`](deploy/cloudflared.service):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/cloudflared.service ~/.config/systemd/user/cloudflared.service
+systemctl --user daemon-reload
+systemctl --user enable --now cloudflared.service
+journalctl --user -u cloudflared -f
+```
 
 ## Alternative tunnel: `ngrok`
 
@@ -149,39 +202,59 @@ A systemd unit is provided in [`deploy/ngrok.service`](deploy/ngrok.service).
 
 ## Running as a service on the mini-PC
 
-Install [`deploy/hermes-mcp.service`](deploy/hermes-mcp.service) (and the cloudflared unit if you went that route):
+Install [`deploy/hermes-mcp.service`](deploy/hermes-mcp.service) as a **systemd user unit** so it shares the lifecycle of your other personal services (e.g. `hermes-gateway`, `mcp-proxy`):
 
 ```bash
-sudo cp deploy/hermes-mcp.service /etc/systemd/system/
-sudo install -m 0600 .env.example /etc/hermes-mcp.env  # then edit it
-sudo systemctl daemon-reload
-sudo systemctl enable --now hermes-mcp
-journalctl -u hermes-mcp -f
+# 1. Install hermes-mcp on a stable path
+pipx install hermes-mcp
+
+# 2. Set up the env file (mode 0600)
+mkdir -p ~/.config/hermes-mcp
+install -m 0600 .env.example ~/.config/hermes-mcp/env
+$EDITOR ~/.config/hermes-mcp/env       # fill in OAUTH_*, HERMES_API_KEY, etc.
+
+# 3. Install the unit
+mkdir -p ~/.config/systemd/user
+cp deploy/hermes-mcp.service ~/.config/systemd/user/
+
+# 4. Make sure user services start at boot, not just login
+loginctl enable-linger "$USER"
+
+# 5. Enable + start
+systemctl --user daemon-reload
+systemctl --user enable --now hermes-mcp
+journalctl --user -u hermes-mcp -f
 ```
+
+Restart after editing the env file: `systemctl --user restart hermes-mcp`.
 
 ## Security
 
-**This bridge lets a remote LLM run actions on your machine via Hermes.** Treat it accordingly. Full threat model in [SECURITY.md](SECURITY.md). In short:
+**This bridge lets a remote LLM run actions on your machine via Hermes.** Treat it accordingly. Full threat model in [THREAT_MODEL.md](THREAT_MODEL.md). In short:
 
 - **Do not run Hermes with `--yolo`.** Keep approval hooks on.
-- **Scope `HERMES_TOOLSETS`** to the minimum your use case needs.
-- **The OAuth client_secret is a credential.** A leaked secret + the issuer URL is enough to mint access tokens against your bridge. Rotate (`hermes-mcp mint-client`, restart) if exposed.
+- **Scope `platform_toolsets.api_server`** in your Hermes config to the minimum toolset your use case needs (see [What Claude sees](#hermes_askprompt-session_id-toolsets)).
+- **The OAuth `client_secret` and `HERMES_API_KEY` are credentials.** A leaked `client_secret` lets an attacker mint access tokens against your bridge; a leaked `HERMES_API_KEY` lets them bypass the bridge and call the gateway directly. Rotate (`hermes-mcp mint-client` for OAuth; edit `API_SERVER_KEY` in `~/.hermes/.env` for the gateway) if exposed.
 - **Prompt injection is real.** A malicious prompt slipping into Claude's context (via a webpage, a file you pasted) can craft tool calls. Hermes's own approval hooks are your last line of defense — keep them on.
 
 Code-side mitigations baked in:
 
-- `subprocess.run` with argument lists; `shell=True` is never used.
-- OAuth 2.1 with PKCE; client_secret comparison via `hmac.compare_digest`. Access tokens are 256-bit random opaque strings, expire after 1 hour, and live only in memory (no on-disk persistence).
-- Prompt bodies logged only at `DEBUG`. INFO logs are length + session_id + duration only.
-- **No telemetry, ever.** Your prompts go Claude → tunnel edge → your mini-PC → Hermes. Nothing else.
+- OAuth 2.1 with mandatory PKCE-S256. `client_secret` comparison via `hmac.compare_digest`. Authorization codes are single-use with atomic pop-on-exchange; refresh tokens rotate atomically and approximate RFC 6819 reuse detection.
+- `redirect_uri` scheme allowlist on `/authorize` (https, http-on-localhost, claude, claudeai) prevents the bridge becoming an open redirector to `javascript:` / `data:` URIs.
+- Access tokens are 256-bit `secrets.token_urlsafe`, expire after 1 hour, live only in memory (no on-disk persistence). Refresh tokens 30d, also in memory.
+- DNS-rebinding protection via `MCP_ALLOWED_HOSTS` enforced at the transport layer.
+- Prompt bodies and gateway response bodies logged only at `DEBUG`. INFO logs are endpoint + length + session_id + duration only. The OAuth `state` parameter is sanitized before logging.
+- Bind defaults to `127.0.0.1`; non-loopback `BIND_HOST` triggers a startup warning.
+- **No telemetry, ever.** Your prompts go Claude → tunnel edge → bridge → gateway. Nothing else.
 
 ## Common pitfalls
 
-- **`hermes` not on PATH** → set `HERMES_BIN` to its absolute path.
-- **Connector stuck on "Verifying"** → 9 times out of 10 it's a wrong client_id or client_secret, or `OAUTH_ISSUER_URL` doesn't match the URL you pasted into Claude. They must be the same hostname.
+- **`hermes-mcp doctor` reports "hermes gateway unreachable"** → the gateway isn't running. `systemctl --user status hermes-gateway` will tell you why.
+- **`doctor` reports "rejected the API key (401)"** → `HERMES_API_KEY` doesn't match `API_SERVER_KEY` in `~/.hermes/.env`. Update one or the other and restart.
+- **Connector stuck on "Verifying"** → 9 times out of 10 it's a wrong `client_id` or `client_secret`, or `OAUTH_ISSUER_URL` doesn't match the URL you pasted into Claude. They must be the same hostname.
 - **"Invalid Host header" / 421** → your tunnel hostname isn't in `MCP_ALLOWED_HOSTS`. Add it (comma-separated) and restart.
-- **Cloudflared 502** → your `hermes-mcp` service isn't running. `journalctl -u hermes-mcp` will tell you why.
-- **Cron jobs scheduled via Hermes don't fire** → check that `HERMES_HOME` in the systemd `EnvironmentFile` matches the user that owns the Hermes data directory. By default Hermes uses `$HOME/.hermes`.
+- **Cloudflared 502** → `hermes-mcp` isn't running. `journalctl --user -u hermes-mcp` will tell you why.
+- **Restart invalidates Claude's tokens** → expected; refresh tokens are in-memory. Claude's next call triggers a transparent re-auth using the long-lived `client_secret`. If that also fails (e.g., refresh token expired), open the connector once in Claude Desktop to re-authorize.
 
 ## Contributing
 
