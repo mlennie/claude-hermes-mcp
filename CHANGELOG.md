@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-16
+
+### Added
+- **Async job mode for `hermes_ask`.** New optional `async_mode: bool = False`
+  parameter. When `True`, the call returns a JSON string
+  `{"job_id":"<id>","status":"pending"}` immediately and runs the gateway
+  request in a background thread. Designed to escape the MCP client's
+  per-call timeout (~2 minutes for Claude.ai / Claude Desktop) when Hermes
+  needs to chew on a long multi-step task.
+- **`hermes_check(job_id)` tool.** Returns JSON with `status` ∈
+  `{pending, running, completed, failed, cancelled, unknown}`, plus
+  `created_at` / `finished_at` epoch timestamps, `prompt_chars`, optional
+  `session_id`, and `result` or `error`.
+- **`hermes_cancel(job_id)` tool.** Releases the bookkeeping for an
+  in-flight async job. **Does NOT stop the gateway work** — Python cannot
+  safely kill a thread mid-I/O, so the worker runs to completion and any
+  side effects happen anyway. Use this when you want to release the
+  *result*, not undo the *work*. Tool description spells this out.
+- In-memory `JobStore` (`src/hermes_mcp/jobs.py`) with ~24h TTL, 1000-job
+  cap, lazy cleanup on access. Like OAuth state, jobs are not persisted —
+  a server restart loses every in-flight or completed job.
+- Tool description for `hermes_ask` documents `async_mode` and tells the
+  caller about `hermes_check` and `hermes_cancel`.
+
+### Changed
+- **Single-tool design rescinded** (see CLAUDE.md). The server now exposes
+  three tools tightly coupled around the async-job lifecycle: `hermes_ask`
+  (submit), `hermes_check` (poll), `hermes_cancel` (release). The shape of
+  `hermes_ask` in sync mode is unchanged — old callers continue to work
+  without changes.
+- `JobStore.mark_completed` and `JobStore.mark_failed` are now
+  terminal-state-aware: a late-finishing worker thread cannot overwrite a
+  cancellation (or any other terminal state). Both methods now return
+  `bool` to signal whether the state actually changed.
+
+### Security
+- Unexpected worker-thread exceptions surface only their type name in the
+  job record's `error` field (not `str(exc)`). Matches the existing
+  invariant that gateway error bodies are not echoed in user-visible
+  errors; the full traceback still lands in the server log at ERROR.
+- Cancelled jobs never accept a late `result` payload from the worker
+  thread — prevents a "phantom result" race where the user thinks they
+  cancelled and then sees a result appear anyway.
+
 ## [0.2.0] - 2026-05-10
 
 ### Changed (BREAKING)
@@ -64,6 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - systemd units for `hermes-mcp`, cloudflared, and ngrok in `deploy/`.
 - README with architecture diagram, threat model, and tunnel setup walkthroughs.
 
-[Unreleased]: https://github.com/mlennie/claude-hermes-mcp/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/mlennie/claude-hermes-mcp/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/mlennie/claude-hermes-mcp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/mlennie/claude-hermes-mcp/releases/tag/v0.2.0
 [0.1.0]: https://github.com/mlennie/claude-hermes-mcp/releases/tag/v0.1.0

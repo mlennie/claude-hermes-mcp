@@ -1,0 +1,107 @@
+name: Release
+
+# Fires when a `vX.Y.Z` tag is pushed. Builds the wheel/sdist once, then
+# publishes to PyPI via Trusted Publishing (OIDC, no API token stored) and
+# creates a GitHub Release with the matching CHANGELOG section.
+#
+# One-time setup on PyPI (per project, https://pypi.org/manage/project/hermes-mcp/settings/publishing/):
+#   - Owner:               mlennie
+#   - Repository name:     claude-hermes-mcp
+#   - Workflow filename:   release.yml
+#   - Environment name:    (leave blank, or set to `release` if you also
+#                          create a GitHub environment with that name)
+#
+# If trusted publishing is not configured on PyPI yet, the `publish-pypi`
+# job will fail with a clear error pointing at the PyPI settings page —
+# the `github-release` job runs independently and still succeeds.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build wheel + sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: pip install --upgrade build
+
+      - name: Verify tag matches package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(python -c "import tomllib, pathlib; \
+            print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::Tag v$tag does not match pyproject.toml version $pkg"
+            exit 1
+          fi
+
+      - name: Build
+        run: python -m build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish via trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          python <<'PY'
+          import os, re, pathlib
+          tag = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          changelog = pathlib.Path("CHANGELOG.md").read_text()
+          pattern = rf"## \[{re.escape(tag)}\][^\n]*\n(.*?)(?=^## \[|\Z)"
+          m = re.search(pattern, changelog, flags=re.DOTALL | re.MULTILINE)
+          notes = m.group(1).strip() if m else (
+              f"See [CHANGELOG.md](./CHANGELOG.md) for v{tag}."
+          )
+          pathlib.Path("release-notes.md").write_text(notes + "\n")
+          PY
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          files: dist/*
+          fail_on_unmatched_files: true

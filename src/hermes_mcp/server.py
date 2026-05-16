@@ -1,13 +1,20 @@
-"""FastMCP server exposing `hermes_ask` over Streamable HTTP, gated by OAuth 2.1.
+"""FastMCP server exposing `hermes_ask` / `hermes_check` / `hermes_cancel`
+over Streamable HTTP, gated by OAuth 2.1.
 
 `build_app()` constructs a FastMCP instance wired up with our static-client
 OAuth provider. FastMCP itself adds the bearer-validation middleware and the
 authorization endpoints (`/authorize`, `/token`, `/.well-known/...`).
+
+Async-job state lives in the shared `JobStore` owned by `build_app`; the
+three tools are tightly coupled around its lifecycle (submit / poll /
+release).
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import threading
 from typing import Literal
 
 import uvicorn
@@ -21,7 +28,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import AnyHttpUrl
 
 from .config import Config, LogLevel
-from .hermes_client import HermesClient
+from .hermes_client import HermesClient, HermesError
+from .jobs import JobStore
 from .oauth import StaticClientProvider
 
 UvicornLogLevel = Literal["critical", "error", "warning", "info", "debug"]
@@ -56,9 +64,103 @@ Args:
   session_id: Optional. Pass the same id across multiple calls in one chat
     to let Hermes remember prior steps (e.g. draft -> refine -> save).
   toolsets: Optional. Restrict Hermes to specific toolsets for this call.
+  async_mode: Optional. Default False. Decides whether `hermes_ask` blocks
+    on the result or returns a job id immediately. Read this carefully —
+    picking wrong on a long task hits a hard ~2-minute Claude tool-call
+    timeout and the user sees "Error occurred during tool execution":
+
+    USE async_mode=True (the safer default for non-trivial work) WHEN ANY
+    of these are true about the user's request:
+      - Three or more distinct external actions (e.g. "create 5 folders",
+        "send 3 emails", "open N Linear issues")
+      - Browser-driven work (each page load adds 5-10 seconds; almost any
+        scraping or research task should be async)
+      - Drive folder trees, document generation, or multi-recipient outreach
+      - Multi-step agentic work where Hermes will chain several tool calls
+        before responding
+      - Anything you'd estimate could take more than ~30 seconds
+      - Tasks that may require user approval on Telegram (those buttons
+        add latency unpredictably)
+      - You're not sure. False async costs you a polling loop. False sync
+        costs you the whole task hitting the 2-minute cliff and side
+        effects (emails sent, files created) being partial and unreported.
+
+    USE async_mode=False (sync) ONLY when ALL of these are true:
+      - Exactly one external action (one email, one message, one cron,
+        one file save) OR no external action at all (a question Hermes
+        can answer from its own knowledge / skills)
+      - You confidently expect the response in under ~30 seconds
+      - There are no Telegram-approval-gated tools likely to fire
+
+  Async behavior: `hermes_ask` returns a JSON string
+  `{"job_id":"...","status":"pending"}` immediately. Hermes runs in the
+  background. Poll `hermes_check(job_id)` every 5-10 seconds (not faster)
+  for the result. Call `hermes_cancel(job_id)` if the user no longer
+  wants the result — note this RELEASES the bookkeeping but does NOT
+  stop the gateway from running; side effects already started will
+  continue.
 
 Returns:
-  Hermes's final answer text.
+  Sync mode: Hermes's final answer text.
+  Async mode: JSON string `{"job_id":"<id>","status":"pending"}`.
+"""
+
+_CHECK_TOOL_DESCRIPTION = """\
+Check the status of an async hermes_ask job.
+
+Use this only with a `job_id` returned by a prior `hermes_ask(..., async_mode=True)`
+call. Polls Hermes Agent's in-memory job store for the result.
+
+Polling guidance: wait at least 5-10 seconds between calls; Hermes jobs that
+need async mode typically take minutes, not seconds, and tight polling just
+burns the user's tokens. `completed`, `failed`, `cancelled`, and `unknown`
+are all terminal — do not keep polling after seeing them. `unknown`
+specifically means the id was never issued by this server (or its result
+was reaped or lost on restart); polling will never turn it back into a
+result.
+
+Args:
+  job_id: The job id returned by the original async hermes_ask call.
+
+Returns:
+  JSON string with `job_id`, `status` (one of `pending`, `running`,
+  `completed`, `failed`, `cancelled`, `unknown`), `created_at` (epoch
+  seconds), `prompt_chars`, and:
+    - `session_id` if the caller supplied one
+    - `finished_at` (epoch seconds) once terminal
+    - `result` on completed
+    - `error` on failed
+  Jobs are kept ~24 hours after they reach a terminal state.
+"""
+
+_CANCEL_TOOL_DESCRIPTION = """\
+Cancel (release) an async hermes_ask job.
+
+IMPORTANT — what this does and does not do:
+  - Marks the job as `cancelled` in this server's bookkeeping. Subsequent
+    `hermes_check` calls return `status: cancelled`.
+  - Does NOT stop the worker thread or the underlying gateway call. Python
+    cannot safely kill a thread that's blocked on I/O. Hermes will keep
+    running until it finishes or hits its 300-second timeout. Any side
+    effects the gateway produces (emails sent, files created, calendar
+    events scheduled, etc.) happen anyway.
+
+Use this when you want to release the *result* (because the user changed
+their mind or doesn't need it anymore). Do NOT use this expecting it to
+undo work already in progress. If the work itself needs to be undone, do
+that explicitly — e.g. ask Hermes to delete the Drive folder it just
+created.
+
+Cancelling an already-terminal job (completed, failed, cancelled, or
+unknown) is a no-op.
+
+Args:
+  job_id: The job id returned by the original async hermes_ask call.
+
+Returns:
+  JSON string with the same shape as `hermes_check`. If the job was
+  still in flight, `status` will be `cancelled`. If it was already
+  terminal, the existing status is returned unchanged.
 """
 
 
@@ -82,8 +184,46 @@ def _build_transport_security(config: Config) -> TransportSecuritySettings:
     )
 
 
-def build_app(config: Config, client: HermesClient) -> FastMCP:
-    """Create a FastMCP server with the hermes_ask tool and OAuth wired up."""
+def _run_job(
+    client: HermesClient,
+    jobs: JobStore,
+    job_id: str,
+    prompt: str,
+    session_id: str | None,
+    toolsets: list[str] | None,
+) -> None:
+    """Background worker: invoke the gateway and stash the outcome.
+
+    Runs in a daemon thread spawned by `hermes_ask(..., async_mode=True)`.
+    Any HermesError or unexpected exception is captured into the job record;
+    nothing is re-raised because there's no caller to receive it.
+    """
+    jobs.mark_running(job_id)
+    try:
+        result = client.ask(prompt, session_id=session_id, toolsets=toolsets)
+    except HermesError as exc:
+        logger.info("async job %s failed: %s", job_id, exc)
+        jobs.mark_failed(job_id, str(exc))
+    except Exception as exc:
+        # Final boundary for the worker thread — nothing else will catch this.
+        logger.exception("async job %s crashed", job_id)
+        jobs.mark_failed(job_id, f"unexpected error: {type(exc).__name__}")
+    else:
+        jobs.mark_completed(job_id, result)
+
+
+def build_app(
+    config: Config,
+    client: HermesClient,
+    jobs: JobStore | None = None,
+) -> FastMCP:
+    """Create a FastMCP server with the hermes_ask, hermes_check, and
+    hermes_cancel tools wired up.
+
+    `jobs` is exposed so tests can inject a store with a short TTL or a
+    small capacity. In normal use a fresh `JobStore()` is created per app
+    instance.
+    """
     provider = StaticClientProvider(
         client_id=config.oauth_client_id,
         client_secret=config.oauth_client_secret,
@@ -108,14 +248,56 @@ def build_app(config: Config, client: HermesClient) -> FastMCP:
         transport_security=_build_transport_security(config),
     )
 
+    job_store = jobs if jobs is not None else JobStore()
+
     @mcp.tool(description=_TOOL_DESCRIPTION)
     def hermes_ask(
         prompt: str,
         session_id: str | None = None,
         toolsets: list[str] | None = None,
+        async_mode: bool = False,
     ) -> str:
         # HermesError propagates; FastMCP wraps any Exception in ToolError.
-        return client.ask(prompt, session_id=session_id, toolsets=toolsets)
+        if not async_mode:
+            return client.ask(prompt, session_id=session_id, toolsets=toolsets)
+
+        job = job_store.create(prompt_chars=len(prompt), session_id=session_id)
+        logger.info(
+            "async job %s queued (prompt_chars=%d session=%s)",
+            job.job_id,
+            len(prompt),
+            "y" if session_id else "n",
+        )
+        thread = threading.Thread(
+            target=_run_job,
+            args=(client, job_store, job.job_id, prompt, session_id, toolsets),
+            name=f"hermes-job-{job.job_id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+        return json.dumps({"job_id": job.job_id, "status": "pending"})
+
+    @mcp.tool(description=_CHECK_TOOL_DESCRIPTION)
+    def hermes_check(job_id: str) -> str:
+        job = job_store.get(job_id)
+        if job is None:
+            return json.dumps({"job_id": job_id, "status": "unknown"})
+        return json.dumps(job.to_dict())
+
+    @mcp.tool(description=_CANCEL_TOOL_DESCRIPTION)
+    def hermes_cancel(job_id: str) -> str:
+        # Best-effort mark; the worker thread may already have finished.
+        changed = job_store.mark_cancelled(job_id)
+        job = job_store.get(job_id)
+        if job is None:
+            # Unknown id — never issued by this server (reap-between-calls
+            # is impossible: mark_cancelled would have just set finished_at,
+            # and the reap window is 24h, so a freshly-cancelled job cannot
+            # vanish here).
+            return json.dumps({"job_id": job_id, "status": "unknown"})
+        if changed:
+            logger.info("async job %s cancelled by caller", job_id)
+        return json.dumps(job.to_dict())
 
     return mcp
 

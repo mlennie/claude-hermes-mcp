@@ -4,12 +4,16 @@ and confirm the tool works when the underlying HermesClient is mocked.
 
 from __future__ import annotations
 
+import json
+import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
 
 from hermes_mcp.config import Config
 from hermes_mcp.hermes_client import HermesError
+from hermes_mcp.jobs import JobStore
 from hermes_mcp.server import build_app
 
 VALID_ENV: dict[str, str] = {
@@ -103,3 +107,292 @@ def test_oauth_issuer_url_no_double_slash_in_resource_url() -> None:
     resource_url = str(mcp.settings.auth.resource_server_url)  # type: ignore[union-attr]
     assert "//mcp" not in resource_url.replace("https://", "")
     assert resource_url.endswith("/mcp")
+
+
+# --- async_mode + hermes_check ------------------------------------------------
+
+
+def _await_job(jobs: JobStore, job_id: str, timeout: float = 2.0) -> None:
+    """Block until the background worker finishes the given job, or fail.
+
+    Treats all terminal statuses (`completed`, `failed`, `cancelled`) as
+    finished. Tests that submit a job and then cancel it can use this to
+    confirm the worker has fully exited rather than racing it.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = jobs.get(job_id)
+        if job is not None and job.status in {"completed", "failed", "cancelled"}:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"job {job_id} did not finish within {timeout}s")
+
+
+def test_build_app_registers_hermes_check() -> None:
+    cfg = _config()
+    client = MagicMock()
+    mcp = build_app(cfg, client)
+    tool_names = {t.name for t in mcp._tool_manager.list_tools()}
+    assert "hermes_check" in tool_names
+
+
+def test_async_mode_returns_pending_job_id_immediately() -> None:
+    cfg = _config()
+    client = MagicMock()
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_ask(*_a: object, **_kw: object) -> str:
+        started.set()
+        release.wait(timeout=2)
+        return "eventual answer"
+
+    client.ask.side_effect = slow_ask
+
+    jobs = JobStore()
+    mcp = build_app(cfg, client, jobs=jobs)
+    ask_tool = mcp._tool_manager.get_tool("hermes_ask")
+    assert ask_tool is not None
+
+    out = ask_tool.fn(prompt="hi", session_id=None, toolsets=None, async_mode=True)
+    payload = json.loads(out)
+    assert payload["status"] == "pending"
+    assert "job_id" in payload
+    # Worker must already be running by the time hermes_ask returns.
+    assert started.wait(timeout=1.0)
+    release.set()
+    _await_job(jobs, payload["job_id"])
+
+
+def test_hermes_check_returns_completed_result() -> None:
+    cfg = _config()
+    client = MagicMock()
+    client.ask.return_value = "the answer"
+
+    jobs = JobStore()
+    mcp = build_app(cfg, client, jobs=jobs)
+    ask_tool = mcp._tool_manager.get_tool("hermes_ask")
+    check_tool = mcp._tool_manager.get_tool("hermes_check")
+    assert ask_tool is not None
+    assert check_tool is not None
+
+    submit_payload = json.loads(
+        ask_tool.fn(prompt="hi", session_id=None, toolsets=None, async_mode=True)
+    )
+    _await_job(jobs, submit_payload["job_id"])
+
+    result_payload = json.loads(check_tool.fn(job_id=submit_payload["job_id"]))
+    assert result_payload["status"] == "completed"
+    assert result_payload["result"] == "the answer"
+    assert "error" not in result_payload
+
+
+def test_hermes_check_returns_failed_on_hermes_error() -> None:
+    cfg = _config()
+    client = MagicMock()
+    client.ask.side_effect = HermesError("gateway exploded")
+
+    jobs = JobStore()
+    mcp = build_app(cfg, client, jobs=jobs)
+    ask_tool = mcp._tool_manager.get_tool("hermes_ask")
+    check_tool = mcp._tool_manager.get_tool("hermes_check")
+    assert ask_tool is not None
+    assert check_tool is not None
+
+    submit_payload = json.loads(
+        ask_tool.fn(prompt="hi", session_id=None, toolsets=None, async_mode=True)
+    )
+    _await_job(jobs, submit_payload["job_id"])
+
+    result_payload = json.loads(check_tool.fn(job_id=submit_payload["job_id"]))
+    assert result_payload["status"] == "failed"
+    assert result_payload["error"] == "gateway exploded"
+    assert "result" not in result_payload
+
+
+def test_hermes_check_redacts_unexpected_exception_message() -> None:
+    """If the worker hits a non-HermesError exception, the message is NOT
+    echoed in the job record — only the exception type. Matches the existing
+    'gateway error bodies are redacted from user-facing errors' invariant."""
+    cfg = _config()
+    client = MagicMock()
+    secret = "SHOULD_NOT_LEAK_THROUGH_ERROR"
+    client.ask.side_effect = RuntimeError(secret)
+
+    jobs = JobStore()
+    mcp = build_app(cfg, client, jobs=jobs)
+    ask_tool = mcp._tool_manager.get_tool("hermes_ask")
+    check_tool = mcp._tool_manager.get_tool("hermes_check")
+    assert ask_tool is not None
+    assert check_tool is not None
+
+    submit_payload = json.loads(
+        ask_tool.fn(prompt="hi", session_id=None, toolsets=None, async_mode=True)
+    )
+    _await_job(jobs, submit_payload["job_id"])
+
+    result_payload = json.loads(check_tool.fn(job_id=submit_payload["job_id"]))
+    assert result_payload["status"] == "failed"
+    assert secret not in result_payload["error"]
+    assert "RuntimeError" in result_payload["error"]
+
+
+def test_hermes_check_unknown_job_id() -> None:
+    cfg = _config()
+    client = MagicMock()
+    mcp = build_app(cfg, client)
+    check_tool = mcp._tool_manager.get_tool("hermes_check")
+    assert check_tool is not None
+
+    result = json.loads(check_tool.fn(job_id="not-a-real-id"))
+    assert result == {"job_id": "not-a-real-id", "status": "unknown"}
+
+
+def test_sync_mode_unchanged() -> None:
+    """async_mode=False (the default) must behave identically to v0.2.0:
+    return the gateway response text directly, no job_id involved."""
+    cfg = _config()
+    client = MagicMock()
+    client.ask.return_value = "direct answer"
+    mcp = build_app(cfg, client)
+    ask_tool = mcp._tool_manager.get_tool("hermes_ask")
+    assert ask_tool is not None
+    out = ask_tool.fn(prompt="hi", session_id="s1", toolsets=None)
+    assert out == "direct answer"
+    client.ask.assert_called_once_with("hi", session_id="s1", toolsets=None)
+
+
+def test_async_mode_forwards_session_id_and_toolsets_to_worker() -> None:
+    """Worker thread must call client.ask with the same session_id and
+    toolsets the MCP caller supplied — a closure bug here would be silent."""
+    cfg = _config()
+    client = MagicMock()
+    client.ask.return_value = "ok"
+
+    jobs = JobStore()
+    mcp = build_app(cfg, client, jobs=jobs)
+    ask_tool = mcp._tool_manager.get_tool("hermes_ask")
+    assert ask_tool is not None
+
+    submit_payload = json.loads(
+        ask_tool.fn(
+            prompt="hi",
+            session_id="sess-async",
+            toolsets=["hermes-telegram"],
+            async_mode=True,
+        )
+    )
+    _await_job(jobs, submit_payload["job_id"])
+
+    client.ask.assert_called_once_with("hi", session_id="sess-async", toolsets=["hermes-telegram"])
+
+
+def test_build_app_registers_hermes_cancel() -> None:
+    cfg = _config()
+    client = MagicMock()
+    mcp = build_app(cfg, client)
+    tool_names = {t.name for t in mcp._tool_manager.list_tools()}
+    assert "hermes_cancel" in tool_names
+
+
+def test_hermes_cancel_releases_in_flight_job() -> None:
+    """Cancel while running -> status flips to cancelled. The worker is still
+    running on a real thread; we let it finish in this test to verify the
+    late-arriving result doesn't undo the cancellation (separate test below)."""
+    cfg = _config()
+    client = MagicMock()
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def hold(*_a: object, **_kw: object) -> str:
+        started.set()
+        release.wait(timeout=2)
+        return "would-be-result"
+
+    client.ask.side_effect = hold
+
+    jobs = JobStore()
+    mcp = build_app(cfg, client, jobs=jobs)
+    ask_tool = mcp._tool_manager.get_tool("hermes_ask")
+    cancel_tool = mcp._tool_manager.get_tool("hermes_cancel")
+    check_tool = mcp._tool_manager.get_tool("hermes_check")
+    assert ask_tool is not None and cancel_tool is not None and check_tool is not None
+
+    submit = json.loads(ask_tool.fn(prompt="x", async_mode=True))
+    assert started.wait(timeout=1.0)
+
+    cancel_payload = json.loads(cancel_tool.fn(job_id=submit["job_id"]))
+    assert cancel_payload["status"] == "cancelled"
+    assert "finished_at" in cancel_payload
+
+    # Let the worker thread finish; status must remain cancelled.
+    release.set()
+    time.sleep(0.05)  # let the worker's mark_completed fire
+    after = json.loads(check_tool.fn(job_id=submit["job_id"]))
+    assert after["status"] == "cancelled"
+    assert "result" not in after
+
+
+def test_hermes_cancel_is_noop_on_completed_job() -> None:
+    cfg = _config()
+    client = MagicMock()
+    client.ask.return_value = "the answer"
+
+    jobs = JobStore()
+    mcp = build_app(cfg, client, jobs=jobs)
+    ask_tool = mcp._tool_manager.get_tool("hermes_ask")
+    cancel_tool = mcp._tool_manager.get_tool("hermes_cancel")
+    assert ask_tool is not None and cancel_tool is not None
+
+    submit = json.loads(ask_tool.fn(prompt="x", async_mode=True))
+    _await_job(jobs, submit["job_id"])
+
+    payload = json.loads(cancel_tool.fn(job_id=submit["job_id"]))
+    assert payload["status"] == "completed"
+    assert payload["result"] == "the answer"
+
+
+def test_hermes_cancel_unknown_job_id() -> None:
+    cfg = _config()
+    client = MagicMock()
+    mcp = build_app(cfg, client)
+    cancel_tool = mcp._tool_manager.get_tool("hermes_cancel")
+    assert cancel_tool is not None
+    payload = json.loads(cancel_tool.fn(job_id="not-a-real-id"))
+    assert payload == {"job_id": "not-a-real-id", "status": "unknown"}
+
+
+def test_async_mode_surfaces_capacity_error() -> None:
+    """When the JobStore is at capacity, async submission must surface a
+    clear error (not silently drop the request)."""
+    cfg = _config()
+    client = MagicMock()
+
+    jobs = JobStore(max_jobs=1)
+    mcp = build_app(cfg, client, jobs=jobs)
+    ask_tool = mcp._tool_manager.get_tool("hermes_ask")
+    assert ask_tool is not None
+
+    # First async submission fills the only slot.
+    started = threading.Event()
+    release = threading.Event()
+
+    def hold(*_a: object, **_kw: object) -> str:
+        started.set()
+        release.wait(timeout=2)
+        return "done"
+
+    client.ask.side_effect = hold
+
+    first = json.loads(ask_tool.fn(prompt="a", async_mode=True))
+    assert first["status"] == "pending"
+    assert started.wait(timeout=1.0)
+
+    # Second submission must raise — store is at capacity (1) while job #1 runs.
+    with pytest.raises(RuntimeError, match="capacity"):
+        ask_tool.fn(prompt="b", async_mode=True)
+
+    release.set()
+    _await_job(jobs, first["job_id"])
