@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`hermes_reset()` tool.** Clears every job from the in-memory `JobStore`
+  in one call, returning JSON like `{"cleared": 4, "by_status": {"running": 1, "pending": 3}}`.
+  Same caveat as `hermes_cancel`: does NOT stop in-flight worker threads
+  or gateway calls — workers whose jobs are wiped run to completion and
+  no-op when their `mark_completed` / `mark_failed` finds an unknown id.
+  The tool description warns the LLM that the job store is shared across
+  all MCP callers (multiple Claude sessions, background Hermes-agent
+  workflows), so reset is a global operation that should be confirmed
+  with the user when other work might be in flight.
+- `JobStore.reset_all() -> tuple[int, dict[JobStatus, int]]` helper backing
+  the tool. Reaps expired terminal jobs before counting so the returned
+  `by_status` reflects only jobs that were actually live in the store at
+  call time. Typed against the existing `JobStatus` literal for stronger
+  static checks.
+
 ## [0.3.0] - 2026-05-16
 
 ### Added

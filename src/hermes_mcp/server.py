@@ -1,13 +1,13 @@
 """FastMCP server exposing `hermes_ask` / `hermes_check` / `hermes_cancel`
-over Streamable HTTP, gated by OAuth 2.1.
+/ `hermes_reset` over Streamable HTTP, gated by OAuth 2.1.
 
 `build_app()` constructs a FastMCP instance wired up with our static-client
 OAuth provider. FastMCP itself adds the bearer-validation middleware and the
 authorization endpoints (`/authorize`, `/token`, `/.well-known/...`).
 
 Async-job state lives in the shared `JobStore` owned by `build_app`; the
-three tools are tightly coupled around its lifecycle (submit / poll /
-release).
+four tools are tightly coupled around its lifecycle (submit / poll /
+release / clean-slate).
 """
 
 from __future__ import annotations
@@ -114,10 +114,10 @@ call. Polls Hermes Agent's in-memory job store for the result.
 Polling guidance: wait at least 5-10 seconds between calls; Hermes jobs that
 need async mode typically take minutes, not seconds, and tight polling just
 burns the user's tokens. `completed`, `failed`, `cancelled`, and `unknown`
-are all terminal — do not keep polling after seeing them. `unknown`
-specifically means the id was never issued by this server (or its result
-was reaped or lost on restart); polling will never turn it back into a
-result.
+are all terminal — do not keep polling after seeing them. `unknown` means
+one of: the id was never issued by this server, the result was reaped
+(24h after a terminal state) or lost on restart, or the job was wiped by
+a `hermes_reset` call. Polling will never turn `unknown` back into a result.
 
 Args:
   job_id: The job id returned by the original async hermes_ask call.
@@ -131,6 +131,33 @@ Returns:
     - `result` on completed
     - `error` on failed
   Jobs are kept ~24 hours after they reach a terminal state.
+"""
+
+_RESET_TOOL_DESCRIPTION = """\
+Clear ALL jobs from this server's in-memory job store.
+
+Use this to recover from a cluttered or stuck queue when you want a clean
+slate without restarting the server process. After this returns, every
+prior `job_id` becomes `unknown` on `hermes_check` / `hermes_cancel`.
+
+IMPORTANT — same caveat as hermes_cancel, but for every job at once:
+  - Does NOT stop worker threads or underlying gateway calls. Any in-flight
+    Hermes work keeps running until it finishes or hits its 300-second
+    timeout. Side effects (emails sent, files created, etc.) happen anyway.
+  - **All MCP callers share this job store.** Resetting wipes jobs
+    submitted by other Claude sessions and by any background Hermes-agent
+    workflow that uses this same MCP. Treat it as a global operation, not
+    a per-session one. Confirm with the user before calling it if there
+    is any chance other work is in flight that they care about.
+  - Use sparingly. Prefer `hermes_cancel(job_id)` for individual jobs you
+    know about. Reach for `hermes_reset` only when the queue is in a state
+    you don't want to reason about job-by-job.
+
+Returns:
+  JSON string with `cleared` (total jobs removed) and `by_status` (a map
+  of prior status -> count). Example:
+    {"cleared": 4, "by_status": {"running": 1, "pending": 3}}
+  An empty store returns {"cleared": 0, "by_status": {}}.
 """
 
 _CANCEL_TOOL_DESCRIPTION = """\
@@ -217,8 +244,8 @@ def build_app(
     client: HermesClient,
     jobs: JobStore | None = None,
 ) -> FastMCP:
-    """Create a FastMCP server with the hermes_ask, hermes_check, and
-    hermes_cancel tools wired up.
+    """Create a FastMCP server with the hermes_ask, hermes_check,
+    hermes_cancel, and hermes_reset tools wired up.
 
     `jobs` is exposed so tests can inject a store with a short TTL or a
     small capacity. In normal use a fresh `JobStore()` is created per app
@@ -283,6 +310,11 @@ def build_app(
         if job is None:
             return json.dumps({"job_id": job_id, "status": "unknown"})
         return json.dumps(job.to_dict())
+
+    @mcp.tool(description=_RESET_TOOL_DESCRIPTION)
+    def hermes_reset() -> str:
+        cleared, by_status = job_store.reset_all()
+        return json.dumps({"cleared": cleared, "by_status": by_status})
 
     @mcp.tool(description=_CANCEL_TOOL_DESCRIPTION)
     def hermes_cancel(job_id: str) -> str:

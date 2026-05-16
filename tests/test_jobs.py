@@ -146,6 +146,68 @@ def test_mark_cancelled_is_idempotent() -> None:
     assert after.status == "cancelled"
 
 
+def test_reset_all_clears_every_job_and_reports_counts() -> None:
+    store = JobStore()
+    pending = store.create()
+    running = store.create()
+    store.mark_running(running.job_id)
+    done = store.create()
+    store.mark_completed(done.job_id, "ok")
+    boom = store.create()
+    store.mark_failed(boom.job_id, "boom")
+    cancelled = store.create()
+    store.mark_cancelled(cancelled.job_id)
+
+    cleared, by_status = store.reset_all()
+    assert cleared == 5
+    assert by_status == {
+        "pending": 1,
+        "running": 1,
+        "completed": 1,
+        "failed": 1,
+        "cancelled": 1,
+    }
+    assert len(store) == 0
+    # All ids must now be unknown.
+    for job in (pending, running, done, boom, cancelled):
+        assert store.get(job.job_id) is None
+
+
+def test_reset_all_on_empty_store_returns_empty_counts() -> None:
+    assert JobStore().reset_all() == (0, {})
+
+
+def test_reset_all_does_not_break_worker_finishing_late() -> None:
+    """A worker thread whose job was wiped must safely no-op on mark_completed,
+    matching the existing 'mark_unknown_id_is_noop' invariant."""
+    store = JobStore()
+    job = store.create()
+    store.mark_running(job.job_id)
+    store.reset_all()
+    # Worker still believes the job exists; these are the calls it would make.
+    assert store.mark_completed(job.job_id, "late result") is False
+    assert store.mark_failed(job.job_id, "late error") is False
+
+
+def test_reset_all_reaps_expired_terminal_jobs_before_counting() -> None:
+    """Expired terminal jobs should be reaped first, not counted toward the
+    reset summary — keeps the count honest about what was actually live."""
+    store = JobStore(ttl_seconds=10)
+    stale = store.create()
+    store.mark_completed(stale.job_id, "ancient")
+    store._jobs[stale.job_id].finished_at = time.time() - 3600  # 1h ago
+
+    fresh = store.create()  # still pending, never finishes -> never reaped
+
+    cleared, by_status = store.reset_all()
+    assert cleared == 1
+    assert by_status == {"pending": 1}
+    assert len(store) == 0
+    # The fresh id is gone too (full wipe), but the stale one was reaped, not
+    # counted as "completed".
+    assert store.get(fresh.job_id) is None
+
+
 def test_mark_cancelled_works_on_pending_and_running() -> None:
     store = JobStore()
     pending = store.create()

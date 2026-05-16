@@ -364,6 +364,116 @@ def test_hermes_cancel_unknown_job_id() -> None:
     assert payload == {"job_id": "not-a-real-id", "status": "unknown"}
 
 
+def test_build_app_registers_hermes_reset() -> None:
+    cfg = _config()
+    client = MagicMock()
+    mcp = build_app(cfg, client)
+    tool_names = {t.name for t in mcp._tool_manager.list_tools()}
+    assert "hermes_reset" in tool_names
+
+
+def test_hermes_reset_clears_all_jobs_and_reports_counts() -> None:
+    cfg = _config()
+    client = MagicMock()
+    client.ask.return_value = "the answer"
+
+    jobs = JobStore()
+    mcp = build_app(cfg, client, jobs=jobs)
+    ask_tool = mcp._tool_manager.get_tool("hermes_ask")
+    reset_tool = mcp._tool_manager.get_tool("hermes_reset")
+    check_tool = mcp._tool_manager.get_tool("hermes_check")
+    assert ask_tool is not None and reset_tool is not None and check_tool is not None
+
+    # Submit two jobs and let them complete.
+    a = json.loads(ask_tool.fn(prompt="a", async_mode=True))
+    b = json.loads(ask_tool.fn(prompt="b", async_mode=True))
+    _await_job(jobs, a["job_id"])
+    _await_job(jobs, b["job_id"])
+
+    payload = json.loads(reset_tool.fn())
+    assert payload["cleared"] == 2
+    assert payload["by_status"] == {"completed": 2}
+    # Post-reset, both ids are unknown.
+    for jid in (a["job_id"], b["job_id"]):
+        assert json.loads(check_tool.fn(job_id=jid)) == {"job_id": jid, "status": "unknown"}
+
+
+def test_hermes_reset_on_empty_store() -> None:
+    cfg = _config()
+    client = MagicMock()
+    mcp = build_app(cfg, client)
+    reset_tool = mcp._tool_manager.get_tool("hermes_reset")
+    assert reset_tool is not None
+    assert json.loads(reset_tool.fn()) == {"cleared": 0, "by_status": {}}
+
+
+def test_submit_works_after_reset_with_fresh_job_id() -> None:
+    """After hermes_reset, hermes_ask must succeed and return a brand new
+    job_id — no leftover state should pin or collide with the old one."""
+    cfg = _config()
+    client = MagicMock()
+    client.ask.return_value = "fresh answer"
+
+    jobs = JobStore()
+    mcp = build_app(cfg, client, jobs=jobs)
+    ask_tool = mcp._tool_manager.get_tool("hermes_ask")
+    reset_tool = mcp._tool_manager.get_tool("hermes_reset")
+    check_tool = mcp._tool_manager.get_tool("hermes_check")
+    assert ask_tool is not None and reset_tool is not None and check_tool is not None
+
+    first = json.loads(ask_tool.fn(prompt="a", async_mode=True))
+    _await_job(jobs, first["job_id"])
+    reset_tool.fn()
+
+    second = json.loads(ask_tool.fn(prompt="b", async_mode=True))
+    assert second["status"] == "pending"
+    assert second["job_id"] != first["job_id"]
+    _await_job(jobs, second["job_id"])
+    after = json.loads(check_tool.fn(job_id=second["job_id"]))
+    assert after["status"] == "completed"
+    assert after["result"] == "fresh answer"
+    # And the old id is permanently unknown.
+    assert json.loads(check_tool.fn(job_id=first["job_id"]))["status"] == "unknown"
+
+
+def test_hermes_reset_clears_in_flight_job_without_blocking() -> None:
+    """Reset while a worker is mid-flight: the job disappears immediately,
+    and the worker's eventual mark_completed becomes a safe no-op."""
+    cfg = _config()
+    client = MagicMock()
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def hold(*_a: object, **_kw: object) -> str:
+        started.set()
+        release.wait(timeout=2)
+        return "would-be-result"
+
+    client.ask.side_effect = hold
+
+    jobs = JobStore()
+    mcp = build_app(cfg, client, jobs=jobs)
+    ask_tool = mcp._tool_manager.get_tool("hermes_ask")
+    reset_tool = mcp._tool_manager.get_tool("hermes_reset")
+    check_tool = mcp._tool_manager.get_tool("hermes_check")
+    assert ask_tool is not None and reset_tool is not None and check_tool is not None
+
+    submit = json.loads(ask_tool.fn(prompt="x", async_mode=True))
+    assert started.wait(timeout=1.0)
+
+    payload = json.loads(reset_tool.fn())
+    assert payload["cleared"] == 1
+    assert payload["by_status"] == {"running": 1}
+    assert json.loads(check_tool.fn(job_id=submit["job_id"]))["status"] == "unknown"
+
+    # Let the worker finish; it must not resurrect the wiped job.
+    release.set()
+    time.sleep(0.05)
+    assert json.loads(check_tool.fn(job_id=submit["job_id"]))["status"] == "unknown"
+    assert len(jobs) == 0
+
+
 def test_async_mode_surfaces_capacity_error() -> None:
     """When the JobStore is at capacity, async submission must surface a
     clear error (not silently drop the request)."""
