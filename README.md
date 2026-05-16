@@ -87,9 +87,9 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 
 ## What Claude sees
 
-The MCP server exposes one tool:
+The MCP server exposes three tools:
 
-### `hermes_ask(prompt, session_id?, toolsets?)`
+### `hermes_ask(prompt, session_id?, toolsets?, async_mode?)`
 
 Delegates a task to Hermes. Use it for anything Claude cannot do directly:
 
@@ -103,6 +103,60 @@ Delegates a task to Hermes. Use it for anything Claude cannot do directly:
 Pass the same `session_id` across calls within one Claude chat to let Hermes build on previous steps (draft → refine → save). It is forwarded as the `X-Hermes-Session-Id` header so Hermes threads the call into an existing session.
 
 The `toolsets` argument is accepted for backward compatibility but is currently ignored — toolset selection now lives in your Hermes config (`platform_toolsets.api_server`). Set it there to match the Telegram surface (typically `[hermes-telegram]`) so Claude gets the same tools the Telegram path does.
+
+#### Async mode for long-running tasks
+
+Claude.ai and Claude Desktop cancel any single MCP tool call after roughly **two minutes**. If Hermes is going to take longer than that, the call fails with `Error occurred during tool execution` and any side effects already started (emails sent, files created) keep running but aren't reported back. Async mode sidesteps this:
+
+```jsonc
+// hermes_ask(prompt="...", async_mode=true) returns immediately:
+{"job_id": "8a3f...e21", "status": "pending"}
+```
+
+Then poll `hermes_check(job_id)` until `status` is `completed`, `failed`, or `cancelled`. Hermes keeps running in the background regardless of whether you poll. Jobs are stored in-memory for ~24 hours and lost on a server restart.
+
+**When to use async** — Claude reads heuristics from the tool description and should pick the right mode on its own, but the rules of thumb are:
+
+| Use **async** when ANY is true | Use **sync** only when ALL are true |
+|---|---|
+| 3+ distinct external actions (multi-folder, multi-issue, multi-email) | Exactly one external action, or none |
+| Browser-driven work (scraping, research) | Confident response in <30s |
+| Drive trees, doc generation, multi-recipient outreach | No Telegram-approval-gated tools likely to fire |
+| Multi-step agentic work (Hermes will chain tools) | |
+| Estimated >30 seconds | |
+| Telegram approval buttons may appear | |
+| **You're not sure** — pick async | |
+
+False async costs you a polling loop. False sync costs you the whole task hitting the 2-minute cliff. The asymmetry strongly favors async when in doubt.
+
+If you want to force the choice, just say so in your prompt to Claude: *"use `async_mode=true` for this"*.
+
+### `hermes_check(job_id)`
+
+Returns a JSON string with the current status of an async job:
+
+```jsonc
+{"job_id": "8a3f...e21", "status": "completed", "created_at": 1747...,
+ "finished_at": 1747..., "prompt_chars": 12303, "session_id": "...",
+ "result": "..."}
+{"job_id": "8a3f...e21", "status": "failed",    "error":  "...", ...}
+{"job_id": "8a3f...e21", "status": "cancelled", ...}
+{"job_id": "8a3f...e21", "status": "running",   ...}
+{"job_id": "8a3f...e21", "status": "pending",   ...}
+{"job_id": "<your-input>", "status": "unknown"} // never issued by this server, or reaped after 24h
+```
+
+`created_at` and `finished_at` are epoch seconds — Claude can subtract them to show "running for N minutes" in chat.
+
+### `hermes_cancel(job_id)`
+
+Releases an in-flight async job. **Critical caveat: this does NOT stop the gateway from running.**
+
+Python threads can't be safely killed mid-`httpx.post`, so cancellation is bookkeeping only: subsequent `hermes_check` calls return `status: cancelled`, but the Hermes worker keeps running until it finishes or hits its 300-second timeout. Anything Hermes does in the meantime — emails sent, Drive files created, Linear issues opened — *happens anyway*.
+
+Cancel when you want to **release the result**, not undo the work. If the work needs to be undone, ask Hermes to undo it explicitly.
+
+Returns the same JSON shape as `hermes_check`. Cancelling an already-terminal job is a no-op and returns the current status unchanged.
 
 ## Network exposure: `cloudflared`
 
