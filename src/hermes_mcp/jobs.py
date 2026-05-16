@@ -197,9 +197,7 @@ class JobStore:
             cleared = len(self._jobs)
             self._jobs.clear()
         if cleared:
-            logger.info(
-                "job store reset: cleared %d job(s) by_status=%s", cleared, by_status
-            )
+            logger.info("job store reset: cleared %d job(s) by_status=%s", cleared, by_status)
         return cleared, by_status
 
     def __len__(self) -> int:
