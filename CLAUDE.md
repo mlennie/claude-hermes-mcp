@@ -79,4 +79,9 @@ This project ships with `deploy/hermes-mcp.service` and `deploy/cloudflared.serv
 
 ## Release process
 
-Bump version in `src/hermes_mcp/__init__.py` and `pyproject.toml`, move `Unreleased` section in `CHANGELOG.md` to the new version with today's date, tag `v0.X.Y`, push. GitHub Actions publishes to PyPI via trusted publishing.
+Per-release steps:
+1. Bump version in **both** `src/hermes_mcp/__init__.py` and `pyproject.toml`. The release workflow checks they match the pushed tag and fails the build if they don't.
+2. Move the `Unreleased` section in `CHANGELOG.md` to the new version heading with today's date. Keep the `[Unreleased]` heading empty above it. The release workflow's `github-release` job extracts this section verbatim as the release notes.
+3. Commit, tag `vX.Y.Z`, `git push origin main vX.Y.Z`. The tag push fires `.github/workflows/release.yml`, which builds the wheel + sdist, publishes to PyPI via OIDC trusted publishing (no API tokens stored anywhere), and creates a GitHub Release with the CHANGELOG section and built artifacts attached.
+
+One-time setup (already done for this project, listed here so a maintainer rotating the secret doesn't re-do it from scratch): a trusted publisher is configured at https://pypi.org/manage/project/hermes-mcp/settings/publishing/ pointing at this repo, workflow filename `release.yml`, no environment. If the workflow is renamed or moved, the PyPI trusted-publisher entry must be updated to match or the publish step will fail.
