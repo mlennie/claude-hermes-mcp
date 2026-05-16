@@ -87,7 +87,7 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 
 ## What Claude sees
 
-The MCP server exposes three tools:
+The MCP server exposes four tools:
 
 ### `hermes_ask(prompt, session_id?, toolsets?, async_mode?)`
 
@@ -143,7 +143,7 @@ Returns a JSON string with the current status of an async job:
 {"job_id": "8a3f...e21", "status": "cancelled", ...}
 {"job_id": "8a3f...e21", "status": "running",   ...}
 {"job_id": "8a3f...e21", "status": "pending",   ...}
-{"job_id": "<your-input>", "status": "unknown"} // never issued by this server, or reaped after 24h
+{"job_id": "<your-input>", "status": "unknown"} // never issued by this server, reaped after 24h, or wiped by hermes_reset
 ```
 
 `created_at` and `finished_at` are epoch seconds — Claude can subtract them to show "running for N minutes" in chat.
@@ -157,6 +157,22 @@ Python threads can't be safely killed mid-`httpx.post`, so cancellation is bookk
 Cancel when you want to **release the result**, not undo the work. If the work needs to be undone, ask Hermes to undo it explicitly.
 
 Returns the same JSON shape as `hermes_check`. Cancelling an already-terminal job is a no-op and returns the current status unchanged.
+
+### `hermes_reset()`
+
+Wipes every job from the in-memory store in a single call. Use this to recover from a cluttered or stuck queue without restarting the server process. After it returns, every prior `job_id` becomes `unknown` on `hermes_check` and `hermes_cancel`.
+
+```jsonc
+// hermes_reset() returns:
+{"cleared": 4, "by_status": {"running": 1, "pending": 3}}
+{"cleared": 0, "by_status": {}}   // empty store
+```
+
+Same caveat as `hermes_cancel`, but applied to everything at once: it does **not** stop in-flight worker threads or gateway calls. Workers whose jobs are wiped run to completion and their side effects happen anyway; their eventual `mark_completed` becomes a safe no-op when the job id is gone.
+
+**The job store is shared across all MCP callers.** If multiple Claude sessions or a background Hermes-agent workflow are pointed at the same MCP bridge, resetting wipes their jobs too. Treat it as a global operation and confirm with the user before calling it if other work might be in flight.
+
+Expired terminal jobs (older than the 24h TTL) are reaped lazily before counting, so the `by_status` map reflects only what was actually live in the store at call time.
 
 ## Network exposure: `cloudflared`
 

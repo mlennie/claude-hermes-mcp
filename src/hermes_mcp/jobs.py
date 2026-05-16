@@ -172,6 +172,34 @@ class JobStore:
             job.finished_at = time.time()
             return True
 
+    def reset_all(self) -> tuple[int, dict[JobStatus, int]]:
+        """Drop every job from the store. Returns `(cleared, by_status)`.
+
+        Expired terminal jobs are reaped first (matching `create`/`get`) so
+        the returned counts reflect only jobs that were actually live in the
+        store when the caller asked — not zombies waiting for the next
+        lazy-reap pass.
+
+        Like `mark_cancelled`, this does NOT stop any worker threads or the
+        underlying gateway calls — Python cannot safely kill a thread mid-I/O.
+        Workers whose jobs are wiped will run to completion and then no-op
+        when their `mark_completed`/`mark_failed` call finds an unknown id.
+
+        Intended for clearing a stuck or cluttered queue when the operator
+        wants a clean slate without restarting the server process.
+        """
+        now = time.time()
+        with self._lock:
+            self._reap_locked(now)
+            by_status: dict[JobStatus, int] = {}
+            for job in self._jobs.values():
+                by_status[job.status] = by_status.get(job.status, 0) + 1
+            cleared = len(self._jobs)
+            self._jobs.clear()
+        if cleared:
+            logger.info("job store reset: cleared %d job(s) by_status=%s", cleared, by_status)
+        return cleared, by_status
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._jobs)
