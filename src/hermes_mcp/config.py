@@ -13,15 +13,21 @@ import sys
 from dataclasses import dataclass
 from typing import Literal
 
+from hermes_mcp.oauth import DEFAULT_ALLOWED_REDIRECT_SCHEMES as _DEFAULT_SCHEMES
+
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 _VALID_LOG_LEVELS: frozenset[str] = frozenset(("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
+
+# Re-export the canonical default from oauth.py as a sorted tuple. The
+# constant lives in oauth.py because it is fundamentally an OAuth concern;
+# the re-export here gives `test_config` a stable name to assert against
+# and guarantees the env-var default and `StaticClientProvider` default
+# cannot drift apart.
+DEFAULT_OAUTH_ALLOWED_REDIRECT_SCHEMES: tuple[str, ...] = tuple(sorted(_DEFAULT_SCHEMES))
 
 
 class ConfigError(Exception):
     """Raised when required configuration is missing or invalid."""
-
-
-DEFAULT_OAUTH_ALLOWED_REDIRECT_SCHEMES: tuple[str, ...] = ("claude", "claudeai", "cursor")
 
 
 @dataclass(frozen=True)
@@ -106,14 +112,13 @@ class Config:
         # OAuth redirect-URI scheme allowlist. Each MCP client uses its own
         # custom URI scheme for the OAuth redirect (Claude → claude/claudeai,
         # Cursor → cursor, etc.). The default covers the clients we test
-        # against; operators add to it for new clients.
-        schemes_raw = (e.get("OAUTH_ALLOWED_REDIRECT_SCHEMES") or "").strip()
-        if schemes_raw:
-            allowed_redirect_schemes = tuple(
-                s.strip().lower() for s in schemes_raw.split(",") if s.strip()
-            )
-        else:
-            allowed_redirect_schemes = DEFAULT_OAUTH_ALLOWED_REDIRECT_SCHEMES
+        # against; operators add to it for new clients. Any input that
+        # parses to an empty list (whitespace-only, comma-only, etc.) falls
+        # back to the default so a typo can't silently disable every custom
+        # scheme.
+        schemes_raw = e.get("OAUTH_ALLOWED_REDIRECT_SCHEMES") or ""
+        parsed = tuple(s.strip().lower() for s in schemes_raw.split(",") if s.strip())
+        allowed_redirect_schemes = parsed or DEFAULT_OAUTH_ALLOWED_REDIRECT_SCHEMES
 
         log_level_raw = (e.get("LOG_LEVEL") or "INFO").upper()
         if log_level_raw not in _VALID_LOG_LEVELS:

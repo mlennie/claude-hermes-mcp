@@ -10,6 +10,8 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
+from mcp.shared.auth import InvalidRedirectUriError
+from pydantic import AnyUrl
 
 from hermes_mcp.config import Config
 from hermes_mcp.hermes_client import HermesError
@@ -96,6 +98,27 @@ def test_allowed_hosts_origins_handle_scheme_prefix() -> None:
     assert "https://hermes.example.com" in origins
     assert "https://other.example.com" in origins
     assert "https://https://other.example.com" not in origins
+
+
+def test_oauth_allowed_schemes_propagate_from_env_to_validation() -> None:
+    """End-to-end wiring check: `OAUTH_ALLOWED_REDIRECT_SCHEMES` set on the
+    env reaches `_StaticClient.validate_redirect_uri` through Config →
+    build_app → StaticClientProvider → _StaticClient. The two unit tests in
+    test_config.py and test_oauth.py cover the parts in isolation; this
+    catches a regression that breaks the wiring between them."""
+    cfg = Config.from_env({**VALID_ENV, "OAUTH_ALLOWED_REDIRECT_SCHEMES": "vscode"})
+    mcp = build_app(cfg, MagicMock())
+    provider = mcp._auth_server_provider  # type: ignore[attr-defined]
+    assert provider is not None
+    client = provider._client  # type: ignore[attr-defined]
+    # Configured scheme works end-to-end.
+    assert client.validate_redirect_uri(AnyUrl("vscode://continue.continue/cb")) is not None
+    # Baseline survives even when default custom schemes are not configured.
+    assert client.validate_redirect_uri(AnyUrl("https://app.example.com/cb")) is not None
+    # Default custom schemes are NOT accepted when the env var is set to
+    # something else — pins the "env var replaces, not extends" contract.
+    with pytest.raises(InvalidRedirectUriError, match="not allowed"):
+        client.validate_redirect_uri(AnyUrl("claude://oauth/cb"))
 
 
 def test_oauth_issuer_url_no_double_slash_in_resource_url() -> None:

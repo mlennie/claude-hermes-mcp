@@ -161,3 +161,11 @@ def test_allowed_redirect_schemes_replaces_default_when_set() -> None:
 def test_allowed_redirect_schemes_empty_string_falls_back_to_default() -> None:
     cfg = Config.from_env({**VALID_BASE, "OAUTH_ALLOWED_REDIRECT_SCHEMES": "  "})
     assert cfg.allowed_redirect_schemes == ("claude", "claudeai", "cursor")
+
+
+def test_allowed_redirect_schemes_comma_only_falls_back_to_default() -> None:
+    """A typo like `,` or `,,,` would otherwise parse to an empty tuple and
+    silently disable every custom scheme. Treat empty parse result as 'unset'."""
+    for raw in (",", ",,,", " , , ,"):
+        cfg = Config.from_env({**VALID_BASE, "OAUTH_ALLOWED_REDIRECT_SCHEMES": raw})
+        assert cfg.allowed_redirect_schemes == ("claude", "claudeai", "cursor"), raw

@@ -62,6 +62,13 @@ MAX_OUTSTANDING_ACCESS_TOKENS = 4096
 # redirector to dangerous targets.
 _BASELINE_SCHEMES: frozenset[str] = frozenset({"https", "http"})
 
+# Default custom URI schemes the bridge accepts on top of the baseline. Each
+# entry corresponds to an MCP client's OAuth redirect-URI scheme. Operators
+# extend or override this via `OAUTH_ALLOWED_REDIRECT_SCHEMES` for additional
+# clients (e.g. `vscode` for Continue). Re-exported from `config.py` so the
+# server default and the env-var default cannot drift apart.
+DEFAULT_ALLOWED_REDIRECT_SCHEMES: frozenset[str] = frozenset({"claude", "claudeai", "cursor"})
+
 
 def _check_redirect_uri(redirect_uri: AnyUrl, allowed_schemes: frozenset[str]) -> None:
     """Reject schemes/hosts that would turn the OAuth flow into an open
@@ -135,7 +142,7 @@ class StaticClientProvider(
 
     client_id: str
     client_secret: str
-    allowed_redirect_schemes: frozenset[str] = frozenset({"claude", "claudeai", "cursor"})
+    allowed_redirect_schemes: frozenset[str] = DEFAULT_ALLOWED_REDIRECT_SCHEMES
     access_token_ttl: int = DEFAULT_ACCESS_TOKEN_TTL
     refresh_token_ttl: int = DEFAULT_REFRESH_TOKEN_TTL
 

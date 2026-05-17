@@ -4,7 +4,7 @@
 
 Please **do not** open a public GitHub issue for security problems.
 
-Use **GitHub's private vulnerability reporting** instead: go to the [Security tab](https://github.com/mlennie/claude-hermes-mcp/security) of this repository and click **"Report a vulnerability"**. This opens a private advisory thread visible only to you and the maintainers.
+Use **GitHub's private vulnerability reporting** instead: go to the [Security tab](https://github.com/mlennie/hermes-mcp/security) of this repository and click **"Report a vulnerability"**. This opens a private advisory thread visible only to you and the maintainers.
 
 Please include:
 

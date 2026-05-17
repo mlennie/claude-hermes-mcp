@@ -87,51 +87,31 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 
 ## Client compatibility
 
-Any MCP client that speaks **Streamable HTTP + OAuth 2.1** can connect. The three clients below are explicitly tested; others should work if they support the same protocol.
+Any MCP client that speaks **Streamable HTTP + OAuth 2.1** can connect. You'll need three things from this bridge for any client:
 
-### Claude Desktop / Claude.ai (web + mobile)
+- **Server URL:** `https://<your-tunnel-host>/mcp`
+- **OAuth Client ID:** your `OAUTH_CLIENT_ID`
+- **OAuth Client Secret:** your `OAUTH_CLIENT_SECRET`
 
-**Settings → Connectors → Add custom connector**:
-- **URL:** `https://<your-tunnel-host>/mcp`
-- **Client ID:** your `OAUTH_CLIENT_ID`
-- **Client Secret:** your `OAUTH_CLIENT_SECRET`
+Each client's config format differs — see their own docs for where these go.
 
-Claude completes the OAuth flow itself. Custom URI scheme used for the callback: `claude://` / `claudeai://` — already in the default `OAUTH_ALLOWED_REDIRECT_SCHEMES`.
+### Tested
 
-### OpenAI Codex CLI
+| Client | Custom redirect scheme | Where to configure | Notes |
+|---|---|---|---|
+| **Claude Desktop / Claude.ai (web + mobile)** | `claude://`, `claudeai://` | Settings → Connectors → Add custom connector | Default scheme allowlist already covers this. |
 
-Add to `~/.codex/config.toml`:
+### Claimed-compatible (please confirm and open an issue/PR if your experience differs)
 
-```toml
-[mcp_servers.hermes]
-url = "https://<your-tunnel-host>/mcp"
-oauth_client_id = "<your OAUTH_CLIENT_ID>"
-oauth_client_secret = "<your OAUTH_CLIENT_SECRET>"
-```
+| Client | Custom redirect scheme | Where to configure | Notes |
+|---|---|---|---|
+| **OpenAI Codex CLI** | HTTPS callback (covered by baseline) | [`~/.codex/config.toml`](https://developers.openai.com/codex/config-reference) — `[mcp_servers.*]` section | No extra `OAUTH_ALLOWED_REDIRECT_SCHEMES` needed. |
+| **Cursor** | `cursor://anysphere.cursor-mcp/oauth/callback` | [`~/.cursor/mcp.json`](https://docs.cursor.com/context/mcp) | Default scheme allowlist already covers this. |
+| **Continue (VSCode)** | `vscode://` (when added) | [Continue MCP docs](https://docs.continue.dev/customize/deep-dives/mcp) | Add `vscode` to `OAUTH_ALLOWED_REDIRECT_SCHEMES`. |
 
-Codex uses HTTPS callbacks for the OAuth handshake — covered by the always-allowed baseline; no extra `OAUTH_ALLOWED_REDIRECT_SCHEMES` config needed.
+**Status note:** only Claude has been end-to-end verified by the maintainer at the time of writing. The others are expected to work because hermes-mcp speaks plain Streamable HTTP + OAuth 2.1 (no Claude-specific protocol bits), but the exact config keys for each client live in their own docs and may evolve. If you set one up successfully or hit a snag, please [open an issue](https://github.com/mlennie/hermes-mcp/issues) so the table can be updated.
 
-### Cursor
-
-Add to `~/.cursor/mcp.json`:
-
-```jsonc
-{
-  "mcpServers": {
-    "hermes": {
-      "url": "https://<your-tunnel-host>/mcp",
-      "oauth": {
-        "clientId": "<your OAUTH_CLIENT_ID>",
-        "clientSecret": "<your OAUTH_CLIENT_SECRET>"
-      }
-    }
-  }
-}
-```
-
-Cursor uses `cursor://anysphere.cursor-mcp/oauth/callback` for the OAuth redirect — already in the default `OAUTH_ALLOWED_REDIRECT_SCHEMES`.
-
-### Other clients
+### Adding a new client
 
 If your client uses a custom URI scheme not in the default list, add it to `OAUTH_ALLOWED_REDIRECT_SCHEMES`. Example for Continue (VSCode):
 

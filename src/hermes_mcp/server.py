@@ -51,8 +51,8 @@ logger = logging.getLogger(__name__)
 _TOOL_DESCRIPTION = """\
 Delegate a task to Hermes Agent on this user's mini-PC.
 
-Use this when the user asks for things the calling MCP client cannot do
-directly itself:
+Use this when the user asks for things the calling LLM cannot do directly
+itself:
   - Scheduling cron jobs / recurring tasks
   - Browser-driven web search and scraping
   - Sending email
