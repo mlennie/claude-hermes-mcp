@@ -51,7 +51,8 @@ logger = logging.getLogger(__name__)
 _TOOL_DESCRIPTION = """\
 Delegate a task to Hermes Agent on this user's mini-PC.
 
-Use this when the user asks for things Claude cannot do directly itself:
+Use this when the user asks for things the calling MCP client cannot do
+directly itself:
   - Scheduling cron jobs / recurring tasks
   - Browser-driven web search and scraping
   - Sending email
@@ -66,8 +67,10 @@ Args:
   toolsets: Optional. Restrict Hermes to specific toolsets for this call.
   async_mode: Optional. Default False. Decides whether `hermes_ask` blocks
     on the result or returns a job id immediately. Read this carefully —
-    picking wrong on a long task hits a hard ~2-minute Claude tool-call
-    timeout and the user sees "Error occurred during tool execution":
+    picking wrong on a long task hits the MCP client's per-tool-call
+    timeout and the user sees a tool-execution error. Timeouts vary by
+    client (Claude.ai / Claude Desktop is ~2 minutes; Codex CLI, Cursor,
+    and others differ); when uncertain, prefer async.
 
     USE async_mode=True (the safer default for non-trivial work) WHEN ANY
     of these are true about the user's request:
@@ -82,7 +85,7 @@ Args:
       - Tasks that may require user approval on Telegram (those buttons
         add latency unpredictably)
       - You're not sure. False async costs you a polling loop. False sync
-        costs you the whole task hitting the 2-minute cliff and side
+        costs you the whole task hitting the client's timeout and side
         effects (emails sent, files created) being partial and unreported.
 
     USE async_mode=False (sync) ONLY when ALL of these are true:
@@ -145,10 +148,11 @@ IMPORTANT — same caveat as hermes_cancel, but for every job at once:
     Hermes work keeps running until it finishes or hits its 300-second
     timeout. Side effects (emails sent, files created, etc.) happen anyway.
   - **All MCP callers share this job store.** Resetting wipes jobs
-    submitted by other Claude sessions and by any background Hermes-agent
-    workflow that uses this same MCP. Treat it as a global operation, not
-    a per-session one. Confirm with the user before calling it if there
-    is any chance other work is in flight that they care about.
+    submitted by other MCP-client sessions (Claude, Codex, Cursor, etc.)
+    and by any background Hermes-agent workflow that uses this same MCP.
+    Treat it as a global operation, not a per-session one. Confirm with
+    the user before calling it if there is any chance other work is in
+    flight that they care about.
   - Use sparingly. Prefer `hermes_cancel(job_id)` for individual jobs you
     know about. Reach for `hermes_reset` only when the queue is in a state
     you don't want to reason about job-by-job.
@@ -254,6 +258,7 @@ def build_app(
     provider = StaticClientProvider(
         client_id=config.oauth_client_id,
         client_secret=config.oauth_client_secret,
+        allowed_redirect_schemes=frozenset(config.allowed_redirect_schemes),
     )
 
     issuer_url = AnyHttpUrl(config.oauth_issuer_url)

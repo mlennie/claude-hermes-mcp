@@ -2,9 +2,9 @@
 
 Each `hermes_ask` call becomes a `POST /v1/chat/completions` to the running
 hermes-gateway (default `http://127.0.0.1:8642`). The gateway runs the same
-`AIAgent.run_conversation` loop that drives Telegram, so Claude — talking
-through this bridge — gets the same brain (skills, sessions, tool
-execution) Hermes already has loaded.
+`AIAgent.run_conversation` loop that drives Telegram, so any MCP client
+(Claude, Codex, Cursor, ...) — talking through this bridge — gets the same
+brain (skills, sessions, tool execution) Hermes already has loaded.
 
 Security:
   - HTTPS-or-localhost; the gateway is bound to 127.0.0.1 by default.

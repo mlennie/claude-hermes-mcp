@@ -21,6 +21,9 @@ class ConfigError(Exception):
     """Raised when required configuration is missing or invalid."""
 
 
+DEFAULT_OAUTH_ALLOWED_REDIRECT_SCHEMES: tuple[str, ...] = ("claude", "claudeai", "cursor")
+
+
 @dataclass(frozen=True)
 class Config:
     oauth_client_id: str
@@ -33,6 +36,7 @@ class Config:
     bind_host: str
     bind_port: int
     allowed_hosts: tuple[str, ...]
+    allowed_redirect_schemes: tuple[str, ...]
     log_level: LogLevel
 
     @classmethod
@@ -99,6 +103,18 @@ class Config:
         allowed_hosts_raw = (e.get("MCP_ALLOWED_HOSTS") or "").strip()
         allowed_hosts = tuple(h.strip() for h in allowed_hosts_raw.split(",") if h.strip())
 
+        # OAuth redirect-URI scheme allowlist. Each MCP client uses its own
+        # custom URI scheme for the OAuth redirect (Claude → claude/claudeai,
+        # Cursor → cursor, etc.). The default covers the clients we test
+        # against; operators add to it for new clients.
+        schemes_raw = (e.get("OAUTH_ALLOWED_REDIRECT_SCHEMES") or "").strip()
+        if schemes_raw:
+            allowed_redirect_schemes = tuple(
+                s.strip().lower() for s in schemes_raw.split(",") if s.strip()
+            )
+        else:
+            allowed_redirect_schemes = DEFAULT_OAUTH_ALLOWED_REDIRECT_SCHEMES
+
         log_level_raw = (e.get("LOG_LEVEL") or "INFO").upper()
         if log_level_raw not in _VALID_LOG_LEVELS:
             raise ConfigError(
@@ -127,6 +143,7 @@ class Config:
             bind_host=bind_host,
             bind_port=port,
             allowed_hosts=allowed_hosts,
+            allowed_redirect_schemes=allowed_redirect_schemes,
             log_level=log_level,
         )
 

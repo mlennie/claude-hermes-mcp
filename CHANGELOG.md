@@ -22,6 +22,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `by_status` reflects only jobs that were actually live in the store at
   call time. Typed against the existing `JobStatus` literal for stronger
   static checks.
+- **Multi-client support.** Any MCP client that speaks Streamable HTTP +
+  OAuth 2.1 can now connect — Claude Desktop / Claude.ai (existing),
+  OpenAI Codex CLI, Cursor, and others. No more hardcoded Claude-only
+  assumptions in the OAuth flow or tool descriptions.
+- **`OAUTH_ALLOWED_REDIRECT_SCHEMES` env var.** Comma-separated list of
+  OAuth redirect-URI custom schemes to accept (default:
+  `claude,claudeai,cursor`). `https` and `http`-on-localhost are always
+  allowed as a security baseline. Lets operators extend the allowlist
+  for new clients (e.g. `vscode` for Continue) without code changes.
+
+### Changed
+- Tool descriptions for `hermes_ask` / `hermes_check` / `hermes_cancel` /
+  `hermes_reset` are now client-neutral. No longer hardcode "Claude" as
+  the consumer; async-mode timeout guidance now notes that enforcement
+  varies by client (Claude.ai is ~2 min; Codex CLI, Cursor, others
+  differ). All async/sync decision heuristics remain unchanged.
+- README, CLAUDE.md, `.env.example`, and source-file docstrings reframed
+  around generic MCP clients with explicit support for Claude Desktop,
+  Codex CLI, and Cursor as the tested set.
+- `hermes-mcp mint-client` output now points at any MCP client's config
+  format, not just Claude Desktop's Custom Connector UI.
 
 ## [0.3.0] - 2026-05-16
 

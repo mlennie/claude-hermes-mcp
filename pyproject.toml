@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "hermes-mcp"
 version = "0.3.0"
-description = "MCP bridge that lets Claude Desktop / Claude mobile delegate tasks to a local Hermes Agent"
+description = "MCP bridge that lets any MCP client (Claude, Codex, Cursor, ...) delegate tasks to a local Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
@@ -15,6 +15,9 @@ keywords = [
     "mcp-server",
     "claude",
     "claude-mcp",
+    "codex",
+    "cursor",
+    "oauth",
     "hermes",
     "model-context-protocol",
 ]

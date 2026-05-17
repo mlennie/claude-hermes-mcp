@@ -1,17 +1,16 @@
 # hermes-mcp
 
-> An MCP server that lets **Claude Desktop** and the **Claude mobile app** delegate tasks to a local **[Hermes Agent](https://github.com/hermes-agent/hermes-agent)** running on your own hardware.
+> An MCP server that lets **any MCP client** (Claude Desktop, Claude.ai mobile, OpenAI Codex CLI, Cursor, ...) delegate tasks to a local **[Hermes Agent](https://github.com/hermes-agent/hermes-agent)** running on your own hardware.
 
-Use Claude as your daily chat. When you ask for something Hermes is built for — scheduling cron jobs, browser automation, email, document creation, persistent skills, WhatsApp/Slack messaging — Claude calls Hermes through this bridge.
+Use whichever LLM you prefer as your daily chat. When you ask for something Hermes is built for — scheduling cron jobs, browser automation, email, document creation, persistent skills, WhatsApp/Slack messaging — your client calls Hermes through this bridge.
 
 ```
-┌──────────────────────┐     ┌────────────────────────┐
-│ Claude Desktop       │     │ Claude Android / iOS   │
-│ (laptop)             │     │ (phone)                │
-└──────────┬───────────┘     └──────────┬─────────────┘
-           │ HTTPS (Custom Connector + OAuth 2.1)      │
-           └────────────────┬──────────────────────────┘
-                            ▼
+┌──────────────────────────────────────────────────────┐
+│ MCP client                                           │
+│ (Claude Desktop / Claude.ai / Codex CLI / Cursor /…) │
+└────────────────────────┬─────────────────────────────┘
+                         │ HTTPS + OAuth 2.1
+                         ▼
                 ┌──────────────────────┐
                 │ cloudflared tunnel   │  (public HTTPS edge)
                 └──────────┬───────────┘
@@ -59,7 +58,7 @@ hermes-mcp doctor
 hermes-mcp serve
 ```
 
-In Claude Desktop (or the mobile app), **Settings → Connectors → Add custom connector** → paste `<tunnel-url>/mcp`, then your `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET`. Claude completes the OAuth flow itself.
+Then connect from your MCP client of choice — see [Client compatibility](#client-compatibility) below for per-client config snippets (Claude Desktop, Codex CLI, Cursor).
 
 Once you've confirmed it works end-to-end, follow the [named tunnel](#named-tunnel-for-keeping-it) and [systemd](#running-as-a-service-on-the-mini-pc) sections to make it permanent.
 
@@ -83,15 +82,72 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 | `BIND_HOST` | no | `127.0.0.1` | Bind address. The tunnel reaches it on localhost. **Do not** bind `0.0.0.0` unless you understand the implications. |
 | `BIND_PORT` | no | `8765` | Port. |
 | `HERMES_REQUEST_TIMEOUT_SECONDS` | no | `300` | Max wall-clock per `hermes_ask` call. |
+| `OAUTH_ALLOWED_REDIRECT_SCHEMES` | no | `claude,claudeai,cursor` | Comma-separated OAuth redirect-URI custom schemes to accept. `https` and `http`-on-localhost always allowed. Extend to add support for new MCP clients (e.g. add `vscode` for Continue). |
 | `LOG_LEVEL` | no | `INFO` | `DEBUG` enables prompt-body logging. |
 
-## What Claude sees
+## Client compatibility
+
+Any MCP client that speaks **Streamable HTTP + OAuth 2.1** can connect. The three clients below are explicitly tested; others should work if they support the same protocol.
+
+### Claude Desktop / Claude.ai (web + mobile)
+
+**Settings → Connectors → Add custom connector**:
+- **URL:** `https://<your-tunnel-host>/mcp`
+- **Client ID:** your `OAUTH_CLIENT_ID`
+- **Client Secret:** your `OAUTH_CLIENT_SECRET`
+
+Claude completes the OAuth flow itself. Custom URI scheme used for the callback: `claude://` / `claudeai://` — already in the default `OAUTH_ALLOWED_REDIRECT_SCHEMES`.
+
+### OpenAI Codex CLI
+
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.hermes]
+url = "https://<your-tunnel-host>/mcp"
+oauth_client_id = "<your OAUTH_CLIENT_ID>"
+oauth_client_secret = "<your OAUTH_CLIENT_SECRET>"
+```
+
+Codex uses HTTPS callbacks for the OAuth handshake — covered by the always-allowed baseline; no extra `OAUTH_ALLOWED_REDIRECT_SCHEMES` config needed.
+
+### Cursor
+
+Add to `~/.cursor/mcp.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "hermes": {
+      "url": "https://<your-tunnel-host>/mcp",
+      "oauth": {
+        "clientId": "<your OAUTH_CLIENT_ID>",
+        "clientSecret": "<your OAUTH_CLIENT_SECRET>"
+      }
+    }
+  }
+}
+```
+
+Cursor uses `cursor://anysphere.cursor-mcp/oauth/callback` for the OAuth redirect — already in the default `OAUTH_ALLOWED_REDIRECT_SCHEMES`.
+
+### Other clients
+
+If your client uses a custom URI scheme not in the default list, add it to `OAUTH_ALLOWED_REDIRECT_SCHEMES`. Example for Continue (VSCode):
+
+```bash
+export OAUTH_ALLOWED_REDIRECT_SCHEMES=claude,claudeai,cursor,vscode
+```
+
+Then restart `hermes-mcp` and complete the OAuth handshake from the new client.
+
+## What MCP clients see
 
 The MCP server exposes four tools:
 
 ### `hermes_ask(prompt, session_id?, toolsets?, async_mode?)`
 
-Delegates a task to Hermes. Use it for anything Claude cannot do directly:
+Delegates a task to Hermes. Use it for anything the calling LLM cannot do directly:
 
 - Scheduling cron jobs / recurring tasks
 - Browser-driven web search and scraping
@@ -100,13 +156,13 @@ Delegates a task to Hermes. Use it for anything Claude cannot do directly:
 - Anything that should persist after this chat ends (Hermes memory, skills)
 - Sending WhatsApp / Slack messages via Hermes's messaging gateway
 
-Pass the same `session_id` across calls within one Claude chat to let Hermes build on previous steps (draft → refine → save). It is forwarded as the `X-Hermes-Session-Id` header so Hermes threads the call into an existing session.
+Pass the same `session_id` across calls within one chat to let Hermes build on previous steps (draft → refine → save). It is forwarded as the `X-Hermes-Session-Id` header so Hermes threads the call into an existing session.
 
-The `toolsets` argument is accepted for backward compatibility but is currently ignored — toolset selection now lives in your Hermes config (`platform_toolsets.api_server`). Set it there to match the Telegram surface (typically `[hermes-telegram]`) so Claude gets the same tools the Telegram path does.
+The `toolsets` argument is accepted for backward compatibility but is currently ignored — toolset selection now lives in your Hermes config (`platform_toolsets.api_server`). Set it there to match the Telegram surface (typically `[hermes-telegram]`) so MCP clients get the same tools the Telegram path does.
 
 #### Async mode for long-running tasks
 
-Claude.ai and Claude Desktop cancel any single MCP tool call after roughly **two minutes**. If Hermes is going to take longer than that, the call fails with `Error occurred during tool execution` and any side effects already started (emails sent, files created) keep running but aren't reported back. Async mode sidesteps this:
+Most MCP clients enforce a per-tool-call timeout: Claude.ai / Claude Desktop is roughly **two minutes**; Codex CLI, Cursor, and others differ. If Hermes is going to take longer than the client's limit, the call fails with a tool-execution error and any side effects already started (emails sent, files created) keep running but aren't reported back. Async mode sidesteps this:
 
 ```jsonc
 // hermes_ask(prompt="...", async_mode=true) returns immediately:
@@ -115,7 +171,7 @@ Claude.ai and Claude Desktop cancel any single MCP tool call after roughly **two
 
 Then poll `hermes_check(job_id)` until `status` is `completed`, `failed`, or `cancelled`. Hermes keeps running in the background regardless of whether you poll. Jobs are stored in-memory for ~24 hours and lost on a server restart.
 
-**When to use async** — Claude reads heuristics from the tool description and should pick the right mode on its own, but the rules of thumb are:
+**When to use async** — the calling LLM reads heuristics from the tool description and should pick the right mode on its own, but the rules of thumb are:
 
 | Use **async** when ANY is true | Use **sync** only when ALL are true |
 |---|---|
@@ -129,7 +185,7 @@ Then poll `hermes_check(job_id)` until `status` is `completed`, `failed`, or `ca
 
 False async costs you a polling loop. False sync costs you the whole task hitting the 2-minute cliff. The asymmetry strongly favors async when in doubt.
 
-If you want to force the choice, just say so in your prompt to Claude: *"use `async_mode=true` for this"*.
+If you want to force the choice, just say so in your prompt: *"use `async_mode=true` for this"*.
 
 ### `hermes_check(job_id)`
 
@@ -146,7 +202,7 @@ Returns a JSON string with the current status of an async job:
 {"job_id": "<your-input>", "status": "unknown"} // never issued by this server, reaped after 24h, or wiped by hermes_reset
 ```
 
-`created_at` and `finished_at` are epoch seconds — Claude can subtract them to show "running for N minutes" in chat.
+`created_at` and `finished_at` are epoch seconds — the calling LLM can subtract them to show "running for N minutes" in chat.
 
 ### `hermes_cancel(job_id)`
 
@@ -170,7 +226,7 @@ Wipes every job from the in-memory store in a single call. Use this to recover f
 
 Same caveat as `hermes_cancel`, but applied to everything at once: it does **not** stop in-flight worker threads or gateway calls. Workers whose jobs are wiped run to completion and their side effects happen anyway; their eventual `mark_completed` becomes a safe no-op when the job id is gone.
 
-**The job store is shared across all MCP callers.** If multiple Claude sessions or a background Hermes-agent workflow are pointed at the same MCP bridge, resetting wipes their jobs too. Treat it as a global operation and confirm with the user before calling it if other work might be in flight.
+**The job store is shared across all MCP callers.** If multiple client sessions (Claude, Codex, Cursor, ...) or a background Hermes-agent workflow are pointed at the same MCP bridge, resetting wipes their jobs too. Treat it as a global operation and confirm with the user before calling it if other work might be in flight.
 
 Expired terminal jobs (older than the 24h TTL) are reaped lazily before counting, so the `by_status` map reflects only what was actually live in the store at call time.
 
@@ -192,7 +248,7 @@ sudo apt install cloudflared        # or download from cloudflare.com
 cloudflared tunnel --url http://127.0.0.1:8765
 ```
 
-`cloudflared` prints a URL like `https://random-words-here.trycloudflare.com`. That's your tunnel for as long as the process runs. Use it as the connector URL in Claude:
+`cloudflared` prints a URL like `https://random-words-here.trycloudflare.com`. That's your tunnel for as long as the process runs. Use it as the server URL in your MCP client (see [Client compatibility](#client-compatibility) above):
 
 ```
 Connector URL:  https://random-words-here.trycloudflare.com/mcp
@@ -202,7 +258,7 @@ Client Secret:  <from `hermes-mcp mint-client`>
 
 Set `OAUTH_ISSUER_URL` to `https://random-words-here.trycloudflare.com` and add the hostname to `MCP_ALLOWED_HOSTS` so MCP's DNS-rebinding check accepts it.
 
-⚠ Quick tunnels are ephemeral. The hostname changes every restart — Claude's connector breaks every time. Move to a named tunnel as soon as you're past the smoke test.
+⚠ Quick tunnels are ephemeral. The hostname changes every restart — your client's connector breaks every time. Move to a named tunnel as soon as you're past the smoke test.
 
 ### Named tunnel (for keeping it)
 
@@ -237,7 +293,7 @@ cloudflared tunnel run hermes
 #   ⇒ should print the OAuth metadata JSON
 ```
 
-Your stable URL is now `https://hermes.your-domain.example`. Update Claude's connector to `<URL>/mcp`, set `OAUTH_ISSUER_URL` to the URL, and add `hermes.your-domain.example` to `MCP_ALLOWED_HOSTS`.
+Your stable URL is now `https://hermes.your-domain.example`. Update your MCP client to point at `<URL>/mcp`, set `OAUTH_ISSUER_URL` to the URL, and add `hermes.your-domain.example` to `MCP_ALLOWED_HOSTS`.
 
 Run cloudflared as a systemd user service — see [`deploy/cloudflared.service`](deploy/cloudflared.service):
 
