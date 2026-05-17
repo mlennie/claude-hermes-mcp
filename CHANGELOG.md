@@ -22,10 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `by_status` reflects only jobs that were actually live in the store at
   call time. Typed against the existing `JobStatus` literal for stronger
   static checks.
-- **Multi-client support.** Any MCP client that speaks Streamable HTTP +
-  OAuth 2.1 can now connect — Claude Desktop / Claude.ai (existing),
-  OpenAI Codex CLI, Cursor, and others. No more hardcoded Claude-only
-  assumptions in the OAuth flow or tool descriptions.
+- **Multi-client groundwork.** Removed the hardcoded Claude-only
+  assumptions from the OAuth flow and tool descriptions. Any MCP client
+  that speaks Streamable HTTP + OAuth 2.1 **and supports pasting in a
+  static `client_id` / `client_secret`** can now connect. Today that's
+  still primarily Claude Desktop / Claude.ai. Codex CLI was tested and
+  found to require Dynamic Client Registration (which we currently
+  disable); Cursor / Continue likely have the same requirement. DCR
+  support is tracked as a follow-up so those clients can join — see the
+  Client compatibility section of the README for the current matrix.
 - **`OAUTH_ALLOWED_REDIRECT_SCHEMES` env var.** Comma-separated list of
   OAuth redirect-URI custom schemes to accept (default:
   `claude,claudeai,cursor`). `https` and `http`-on-localhost are always
@@ -39,8 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   varies by client (Claude.ai is ~2 min; Codex CLI, Cursor, others
   differ). All async/sync decision heuristics remain unchanged.
 - README, CLAUDE.md, `.env.example`, and source-file docstrings reframed
-  around generic MCP clients with explicit support for Claude Desktop,
-  Codex CLI, and Cursor as the tested set.
+  around generic MCP clients. The README's Client compatibility section
+  is honest about the current matrix: Claude is the only client tested
+  end-to-end; Codex CLI is confirmed incompatible until DCR support
+  lands; Cursor and Continue are likely in the same boat.
 - `hermes-mcp mint-client` output now points at any MCP client's config
   format, not just Claude Desktop's Custom Connector UI.
 

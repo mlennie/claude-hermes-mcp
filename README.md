@@ -1,8 +1,8 @@
 # hermes-mcp
 
-> An MCP server that lets **any MCP client** (Claude Desktop, Claude.ai mobile, OpenAI Codex CLI, Cursor, ...) delegate tasks to a local **[Hermes Agent](https://github.com/hermes-agent/hermes-agent)** running on your own hardware.
+> An MCP server that lets **Claude Desktop** and **Claude.ai (web + mobile)** — and any other MCP client that supports static OAuth credentials — delegate tasks to a local **[Hermes Agent](https://github.com/hermes-agent/hermes-agent)** running on your own hardware. (See [Client compatibility](#client-compatibility) for the current matrix; Codex CLI and Cursor are tracked for future support pending Dynamic Client Registration.)
 
-Use whichever LLM you prefer as your daily chat. When you ask for something Hermes is built for — scheduling cron jobs, browser automation, email, document creation, persistent skills, WhatsApp/Slack messaging — your client calls Hermes through this bridge.
+Use Claude (or another supported MCP client) as your daily chat. When you ask for something Hermes is built for — scheduling cron jobs, browser automation, email, document creation, persistent skills, WhatsApp/Slack messaging — your client calls Hermes through this bridge.
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -87,33 +87,34 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 
 ## Client compatibility
 
-Any MCP client that speaks **Streamable HTTP + OAuth 2.1** can connect. You'll need three things from this bridge for any client:
+hermes-mcp speaks plain **Streamable HTTP + OAuth 2.1**, but the OAuth provider is configured for **static, pre-shared credentials** (single `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` pair, **DCR disabled**). A client can connect only if it supports pasting in static OAuth client credentials. The MCP ecosystem is mid-transition: some clients still support this, others have moved to Dynamic Client Registration only.
 
-- **Server URL:** `https://<your-tunnel-host>/mcp`
-- **OAuth Client ID:** your `OAUTH_CLIENT_ID`
-- **OAuth Client Secret:** your `OAUTH_CLIENT_SECRET`
+### Tested ✅
 
-Each client's config format differs — see their own docs for where these go.
+| Client | How to connect |
+|---|---|
+| **Claude Desktop / Claude.ai (web + mobile)** | Settings → Connectors → Add custom connector → paste the server URL + your `OAUTH_CLIENT_ID` + your `OAUTH_CLIENT_SECRET`. |
 
-### Tested
+### Known incompatible (DCR-only) ❌
 
-| Client | Custom redirect scheme | Where to configure | Notes |
-|---|---|---|---|
-| **Claude Desktop / Claude.ai (web + mobile)** | `claude://`, `claudeai://` | Settings → Connectors → Add custom connector | Default scheme allowlist already covers this. |
+| Client | Status | Tracking |
+|---|---|---|
+| **OpenAI Codex CLI** | Empirically confirmed incompatible — `codex mcp add` / `codex mcp login` auto-attempts Dynamic Client Registration and fails with `Registration failed: Dynamic client registration not supported`. No documented way to pre-configure a static `client_id` / `client_secret`. | [Add DCR support](https://github.com/mlennie/hermes-mcp/issues) — coming in a future release. |
 
-### Claimed-compatible (please confirm and open an issue/PR if your experience differs)
+### Untested (likely DCR-only, unconfirmed)
 
-| Client | Custom redirect scheme | Where to configure | Notes |
-|---|---|---|---|
-| **OpenAI Codex CLI** | HTTPS callback (covered by baseline) | [`~/.codex/config.toml`](https://developers.openai.com/codex/config-reference) — `[mcp_servers.*]` section | No extra `OAUTH_ALLOWED_REDIRECT_SCHEMES` needed. |
-| **Cursor** | `cursor://anysphere.cursor-mcp/oauth/callback` | [`~/.cursor/mcp.json`](https://docs.cursor.com/context/mcp) | Default scheme allowlist already covers this. |
-| **Continue (VSCode)** | `vscode://` (when added) | [Continue MCP docs](https://docs.continue.dev/customize/deep-dives/mcp) | Add `vscode` to `OAUTH_ALLOWED_REDIRECT_SCHEMES`. |
+These clients use OAuth + custom URI schemes per the MCP spec convention, which strongly suggests they also rely on DCR. We haven't tested them. The scheme allowlist defaults already include their custom URI schemes, so the moment DCR support lands they'll likely work.
 
-**Status note:** only Claude has been end-to-end verified by the maintainer at the time of writing. The others are expected to work because hermes-mcp speaks plain Streamable HTTP + OAuth 2.1 (no Claude-specific protocol bits), but the exact config keys for each client live in their own docs and may evolve. If you set one up successfully or hit a snag, please [open an issue](https://github.com/mlennie/hermes-mcp/issues) so the table can be updated.
+| Client | Custom redirect scheme | Docs |
+|---|---|---|
+| **Cursor** | `cursor://anysphere.cursor-mcp/oauth/callback` (already in default allowlist) | [`~/.cursor/mcp.json`](https://docs.cursor.com/context/mcp) |
+| **Continue (VSCode)** | `vscode://` (add to `OAUTH_ALLOWED_REDIRECT_SCHEMES`) | [Continue MCP docs](https://docs.continue.dev/customize/deep-dives/mcp) |
 
-### Adding a new client
+If you successfully connect one of these (or another client not listed), please [open an issue](https://github.com/mlennie/hermes-mcp/issues) — we'll promote it to "Tested" with your specific config notes.
 
-If your client uses a custom URI scheme not in the default list, add it to `OAUTH_ALLOWED_REDIRECT_SCHEMES`. Example for Continue (VSCode):
+### Adding a new client whose custom URI scheme isn't in the default
+
+If your client supports static OAuth credentials AND uses a redirect scheme not in the default `claude,claudeai,cursor`, add it to `OAUTH_ALLOWED_REDIRECT_SCHEMES`:
 
 ```bash
 export OAUTH_ALLOWED_REDIRECT_SCHEMES=claude,claudeai,cursor,vscode

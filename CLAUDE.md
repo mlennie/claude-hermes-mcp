@@ -27,7 +27,9 @@ hermes-mcp mint-client      # generate a fresh OAuth client_id / client_secret
 
 ## Architecture
 
-**hermes-mcp** is an MCP bridge that lets any MCP client (Claude Desktop, Claude.ai, OpenAI Codex CLI, Cursor, ...) delegate tasks to a locally running **Hermes Agent**. The client calls MCP tools (`hermes_ask`, `hermes_check`, `hermes_cancel`, `hermes_reset`) over an HTTPS tunnel; the bridge gates that with OAuth 2.1 and forwards each call to the Hermes gateway's OpenAI-compatible HTTP API.
+**hermes-mcp** is an MCP bridge that lets MCP clients (today: Claude Desktop / Claude.ai; future: Codex CLI / Cursor / Continue once DCR ships) delegate tasks to a locally running **Hermes Agent**. The client calls MCP tools (`hermes_ask`, `hermes_check`, `hermes_cancel`, `hermes_reset`) over an HTTPS tunnel; the bridge gates that with OAuth 2.1 and forwards each call to the Hermes gateway's OpenAI-compatible HTTP API.
+
+**Static-client-only constraint.** The OAuth provider currently disables Dynamic Client Registration (`ClientRegistrationOptions(enabled=False)` in `build_app`; `StaticClientProvider.register_client` raises `NotImplementedError`). This means a client can only connect if it supports pasting in a static pre-shared `client_id` / `client_secret`. Claude Desktop's Custom Connector UI does. Codex CLI does not (empirically confirmed — `codex mcp login` auto-attempts DCR and fails). Adding DCR support is a tracked follow-up; tool-description / scheme-allowlist changes in 0.4.0 already removed the other Claude-only assumptions.
 
 ```
 MCP client (Claude Desktop / Claude.ai / Codex CLI / Cursor / ...)
