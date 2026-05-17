@@ -27,10 +27,11 @@ VALID_ENV: dict[str, str] = {
     "OAUTH_ISSUER_URL": "http://localhost:8765",
     "HERMES_API_KEY": "k" * 32,
 }
+BEARER_TOKEN = "b" * 48
 
 
-def _build_client() -> TestClient:
-    cfg = Config.from_env(VALID_ENV)
+def _build_client(env: dict[str, str] | None = None) -> TestClient:
+    cfg = Config.from_env(env or VALID_ENV)
     hermes = MagicMock()
     hermes.ask.return_value = "alive"
     mcp = build_app(cfg, hermes)
@@ -229,6 +230,49 @@ def test_token_endpoint_rejects_wrong_pkce_verifier() -> None:
         )
         assert r.status_code == 400
         assert r.json()["error"] == "invalid_grant"
+
+
+def test_mcp_accepts_static_bearer_token_when_configured() -> None:
+    """When MCP_BEARER_TOKEN is set, Codex desktop / Cursor style clients —
+    which send `Authorization: Bearer <fixed-token>` with no prior /token
+    exchange — can /mcp directly. This is the headline bearer-auth contract."""
+    with _build_client({**VALID_ENV, "MCP_BEARER_TOKEN": BEARER_TOKEN}) as c:
+        assert _initialize(c, BEARER_TOKEN) == 200
+
+
+def test_mcp_rejects_wrong_bearer_when_configured() -> None:
+    """A wrong bearer must not succeed even when bearer auth is enabled —
+    it falls through to the OAuth path's normal 401."""
+    with _build_client({**VALID_ENV, "MCP_BEARER_TOKEN": BEARER_TOKEN}) as c:
+        assert _initialize(c, "wrong-bearer-token") == 401
+
+
+def test_mcp_rejects_bearer_when_unconfigured() -> None:
+    """Default deployment (no MCP_BEARER_TOKEN) — even a guess at a bearer
+    string returns 401. Bearer auth is opt-in."""
+    with _build_client() as c:  # default env, no bearer
+        assert _initialize(c, BEARER_TOKEN) == 401
+
+
+def test_oauth_flow_still_works_when_bearer_configured() -> None:
+    """Configuring a bearer token must not regress the OAuth path. Both
+    auth methods coexist on the same server instance."""
+    verifier, challenge = _pkce_pair()
+    with _build_client({**VALID_ENV, "MCP_BEARER_TOKEN": BEARER_TOKEN}) as c:
+        code = _authorize(c, challenge)
+        r = c.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "https://example.com/cb",
+                "client_id": VALID_ENV["OAUTH_CLIENT_ID"],
+                "code_verifier": verifier,
+            },
+        )
+        assert r.status_code == 200, r.text
+        access_token = r.json()["access_token"]
+        assert _initialize(c, access_token) == 200
 
 
 def test_register_endpoint_not_mounted_when_dcr_disabled() -> None:

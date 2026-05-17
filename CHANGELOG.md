@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Static bearer-token auth as an alternative to OAuth.** New optional
+  env var `MCP_BEARER_TOKEN` (32+ chars). When set, the server accepts
+  `Authorization: Bearer <MCP_BEARER_TOKEN>` directly at /mcp, in
+  addition to OAuth-issued access tokens. Both methods coexist on the
+  same instance — Claude / Claude.ai keep using OAuth; clients with no
+  OAuth UI (Codex desktop's custom-MCP form, Cursor's `headers` block)
+  paste the bearer token instead. Compared via `hmac.compare_digest`;
+  first use surfaces a single INFO-level audit log line.
+- **`hermes-mcp mint-bearer-token` CLI command.** Generates a fresh
+  256-bit token and prints paste-ready config snippets for Codex desktop
+  and Cursor.
+
 ### Changed
 - **Server is now a public OAuth client (PKCE-only).** The registered
   client uses `token_endpoint_auth_method="none"` and `client_secret=None`,

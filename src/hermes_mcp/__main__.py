@@ -10,7 +10,7 @@ from . import __version__
 from .config import Config, ConfigError, configure_logging
 from .doctor import DoctorError, run_checks
 from .hermes_client import HermesClient
-from .oauth import mint_client_credentials
+from .oauth import mint_bearer_token, mint_client_credentials
 from .server import serve
 
 logger = logging.getLogger("hermes_mcp")
@@ -30,6 +30,22 @@ def _mint_client() -> int:
     return 0
 
 
+def _mint_bearer_token() -> int:
+    token = mint_bearer_token()
+    print("# Append this to /etc/hermes-mcp.env (or your shell), then restart hermes-mcp:")
+    print(f"MCP_BEARER_TOKEN={token}")
+    print()
+    print("# Use this in MCP clients whose UI has no OAuth flow:")
+    print("#   - Codex desktop's 'Custom MCP' form: Bearer token env var.")
+    print("#   - Cursor's ~/.cursor/mcp.json:")
+    print('#       "headers": { "Authorization": "Bearer ' + token + '" }')
+    print("#   - Anywhere that lets you set Authorization headers on the request.")
+    print()
+    print("# OAuth-based clients (Claude Desktop / Claude.ai) keep working unchanged;")
+    print("# the bearer token is an additional auth path, not a replacement.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="hermes-mcp",
@@ -40,17 +56,20 @@ def main(argv: list[str] | None = None) -> int:
         "command",
         nargs="?",
         default="serve",
-        choices=("serve", "doctor", "mint-client"),
+        choices=("serve", "doctor", "mint-client", "mint-bearer-token"),
         help=(
             "serve (default): run the MCP server. "
             "doctor: run startup checks and exit. "
-            "mint-client: print a fresh OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET pair."
+            "mint-client: print a fresh OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET pair. "
+            "mint-bearer-token: print a fresh MCP_BEARER_TOKEN for clients with no OAuth UI."
         ),
     )
     args = parser.parse_args(argv)
 
     if args.command == "mint-client":
         return _mint_client()
+    if args.command == "mint-bearer-token":
+        return _mint_bearer_token()
 
     try:
         config = Config.from_env()

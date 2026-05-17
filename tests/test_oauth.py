@@ -9,10 +9,11 @@ from mcp.server.auth.provider import AuthorizationCode, AuthorizationParams
 from mcp.shared.auth import InvalidRedirectUriError, OAuthClientInformationFull
 from pydantic import AnyUrl
 
-from hermes_mcp.oauth import StaticClientProvider, mint_client_credentials
+from hermes_mcp.oauth import StaticClientProvider, mint_bearer_token, mint_client_credentials
 
 CLIENT_ID = "hermes-mcp-test"
 CLIENT_SECRET = "s" * 48
+BEARER_TOKEN = "b" * 48
 
 
 def _provider(**kwargs: int) -> StaticClientProvider:
@@ -407,6 +408,86 @@ def test_state_with_newline_is_sanitized_in_logs(
         # Newlines must be escaped before logging; the raw \n must not appear.
         assert "\n" not in m
         assert "FAKE LOG LINE" not in m or "\\n" in m
+
+
+def test_mint_bearer_token_unique_and_strong() -> None:
+    a, b = mint_bearer_token(), mint_bearer_token()
+    assert a != b
+    # token_urlsafe(32) yields >= 40 char strings
+    assert len(a) >= 40
+
+
+def test_load_access_token_accepts_bearer_when_configured() -> None:
+    """When MCP_BEARER_TOKEN is set, presenting it as a bearer token at /mcp
+    succeeds: load_access_token returns a synthetic AccessToken attributed to
+    the configured client_id. Lets Codex desktop / Cursor (no OAuth UI) work."""
+    p = StaticClientProvider(
+        client_id=CLIENT_ID, client_secret=CLIENT_SECRET, bearer_token=BEARER_TOKEN
+    )
+    at = asyncio.run(p.load_access_token(BEARER_TOKEN))
+    assert at is not None
+    assert at.client_id == CLIENT_ID
+    assert at.expires_at is None  # bearer never expires; operator-rotated
+
+
+def test_load_access_token_returns_cached_bearer_object() -> None:
+    """Repeat presentations of the bearer return the same AccessToken instance,
+    so we're not allocating per request on a hot path."""
+    p = StaticClientProvider(
+        client_id=CLIENT_ID, client_secret=CLIENT_SECRET, bearer_token=BEARER_TOKEN
+    )
+    a = asyncio.run(p.load_access_token(BEARER_TOKEN))
+    b = asyncio.run(p.load_access_token(BEARER_TOKEN))
+    assert a is b
+
+
+def test_load_access_token_rejects_wrong_bearer() -> None:
+    p = StaticClientProvider(
+        client_id=CLIENT_ID, client_secret=CLIENT_SECRET, bearer_token=BEARER_TOKEN
+    )
+    assert asyncio.run(p.load_access_token("not-the-bearer-token")) is None
+
+
+def test_load_access_token_no_bearer_when_unconfigured() -> None:
+    """Default behavior (no MCP_BEARER_TOKEN) — no token validates against
+    the bearer path; only OAuth-issued tokens work."""
+    p = _provider()  # no bearer_token kwarg
+    assert asyncio.run(p.load_access_token(BEARER_TOKEN)) is None
+    assert asyncio.run(p.load_access_token("any-string")) is None
+
+
+def test_load_access_token_oauth_path_still_works_when_bearer_configured() -> None:
+    """Configuring a bearer token must not regress the OAuth-issued-token path.
+    Both auth methods coexist."""
+    p = StaticClientProvider(
+        client_id=CLIENT_ID, client_secret=CLIENT_SECRET, bearer_token=BEARER_TOKEN
+    )
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    redirect = asyncio.run(p.authorize(client, _params()))
+    code = redirect.split("code=")[1].split("&")[0]
+    auth_code = cast(AuthorizationCode, asyncio.run(p.load_authorization_code(client, code)))
+    tokens = asyncio.run(p.exchange_authorization_code(client, auth_code))
+
+    loaded = asyncio.run(p.load_access_token(tokens.access_token))
+    assert loaded is not None
+    assert loaded.client_id == CLIENT_ID
+    # And the bearer still works.
+    loaded_bearer = asyncio.run(p.load_access_token(BEARER_TOKEN))
+    assert loaded_bearer is not None
+
+
+def test_bearer_first_use_logs_at_info(caplog: pytest.LogCaptureFixture) -> None:
+    """First successful bearer-auth event surfaces at INFO. Subsequent uses
+    don't spam the log."""
+    p = StaticClientProvider(
+        client_id=CLIENT_ID, client_secret=CLIENT_SECRET, bearer_token=BEARER_TOKEN
+    )
+    with caplog.at_level("INFO", logger="hermes_mcp.oauth"):
+        asyncio.run(p.load_access_token(BEARER_TOKEN))
+        asyncio.run(p.load_access_token(BEARER_TOKEN))
+        asyncio.run(p.load_access_token(BEARER_TOKEN))
+    bearer_logs = [r for r in caplog.records if "static bearer token" in r.message]
+    assert len(bearer_logs) == 1, "expected exactly one first-use log entry"
 
 
 def test_ask_doc_is_not_lost_to_del() -> None:

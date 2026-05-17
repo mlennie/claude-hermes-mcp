@@ -150,10 +150,19 @@ class _StaticClient(OAuthClientInformationFull):
 class StaticClientProvider(
     OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]
 ):
-    """In-memory OAuth provider for a single pre-shared client."""
+    """In-memory OAuth provider for a single pre-shared client.
+
+    Optionally also accepts a static `bearer_token` as an alternative auth
+    method, for MCP clients (Codex desktop's custom-MCP form, Cursor's
+    `headers` block) whose UI has no OAuth flow at all. Both auth paths
+    coexist: each /mcp request is checked against (a) OAuth-issued access
+    tokens, then (b) the configured bearer token. Constant-time comparison
+    via `hmac.compare_digest`.
+    """
 
     client_id: str
     client_secret: str
+    bearer_token: str | None = None
     allowed_redirect_schemes: frozenset[str] = DEFAULT_ALLOWED_REDIRECT_SCHEMES
     access_token_ttl: int = DEFAULT_ACCESS_TOKEN_TTL
     refresh_token_ttl: int = DEFAULT_REFRESH_TOKEN_TTL
@@ -186,6 +195,14 @@ class StaticClientProvider(
         self._access_tokens: dict[str, AccessToken] = {}
         self._refresh_tokens: dict[str, RefreshToken] = {}
         self._refresh_to_access: dict[str, str] = {}
+        # Synthetic AccessToken returned on bearer-token auth. Lazily built
+        # the first time the bearer is presented and cached so we're not
+        # re-allocating per request. No expiry — bearer tokens are
+        # operator-rotated, not time-rotated.
+        self._bearer_access_token: AccessToken | None = None
+        # One-time audit log marker so the first bearer-auth event surfaces
+        # at INFO without spamming every subsequent request.
+        self._bearer_logged: bool = False
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         if hmac.compare_digest(client_id.encode(), self.client_id.encode()):
@@ -275,13 +292,31 @@ class StaticClientProvider(
         return self._mint_token_pair(client, scopes or refresh_token.scopes, None)
 
     async def load_access_token(self, token: str) -> AccessToken | None:
+        # Static bearer-token path: for clients with no OAuth UI. Compared
+        # in constant time. We check OAuth-issued tokens FIRST so that the
+        # bearer comparison only runs on a miss — minor optimization, but
+        # also keeps the OAuth path's behavior identical when no bearer is
+        # configured.
         at = self._access_tokens.get(token)
-        if at is None:
-            return None
-        if at.expires_at and at.expires_at < int(time.time()):
-            self._access_tokens.pop(token, None)
-            return None
-        return at
+        if at is not None:
+            if at.expires_at and at.expires_at < int(time.time()):
+                self._access_tokens.pop(token, None)
+                return None
+            return at
+        if self.bearer_token and hmac.compare_digest(token.encode(), self.bearer_token.encode()):
+            if not self._bearer_logged:
+                logger.info("oauth: static bearer token accepted (first use this process)")
+                self._bearer_logged = True
+            if self._bearer_access_token is None:
+                self._bearer_access_token = AccessToken(
+                    token=token,
+                    client_id=self.client_id,
+                    scopes=[],
+                    expires_at=None,
+                    resource=None,
+                )
+            return self._bearer_access_token
+        return None
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         # Revocation endpoint is not exposed; FastMCP only calls this if
@@ -358,3 +393,9 @@ def mint_client_credentials() -> tuple[str, str]:
         f"hermes-mcp-{secrets.token_urlsafe(8)}",
         secrets.token_urlsafe(32),
     )
+
+
+def mint_bearer_token() -> str:
+    """Generate a fresh static bearer token (256 bits of entropy) for MCP
+    clients whose UI has no OAuth flow (Codex desktop, Cursor headers)."""
+    return secrets.token_urlsafe(32)
