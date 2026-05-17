@@ -1,21 +1,24 @@
 # Threat Model
 
-`hermes-mcp` is a thin OAuth-gated bridge that lets Claude.ai call into a locally running Hermes Agent. This document describes what it protects against, what it does not protect against, and how specific adversary scenarios play out. Read this before deciding whether to deploy it, and read it again before contributing a change that touches auth, the HTTP client, or logging.
+`hermes-mcp` is a thin auth-gated bridge that lets remote MCP clients (Claude.ai, Codex desktop, Cursor, ...) call into a locally running Hermes Agent. This document describes what it protects against, what it does not protect against, and how specific adversary scenarios play out. Read this before deciding whether to deploy it, and read it again before contributing a change that touches auth, the HTTP client, or logging.
 
 ---
 
 ## System overview
 
 ```
-[Claude.ai cloud]
-       │  (HTTPS — Anthropic's servers and CDN)
+[MCP client cloud — Claude.ai / OpenAI / Cursor / ...]
+       │  (HTTPS — the provider's servers and CDN)
        ▼
-[Claude Desktop / Mobile]  ← holds OAuth client_id + client_secret + access/refresh tokens
+[MCP client app — Claude Desktop / Codex desktop / Cursor / ...]
+   • OAuth path: holds client_id + short-lived access/refresh tokens
+   • Bearer path: holds MCP_BEARER_TOKEN (if operator configured one)
        │  (HTTPS — cloudflared / ngrok tunnel)
        ▼
 [hermes-mcp]  ← this project
-  • OAuth 2.1 authorization code + PKCE
-  • mints opaque access tokens (in-memory, 1h TTL)
+  • OAuth 2.1 authorization code + PKCE (public client, no client_secret enforced)
+  • Static bearer-token auth (opt-in via MCP_BEARER_TOKEN)
+  • Mints opaque access tokens (in-memory, 1h TTL)
   • DNS-rebinding protection on /mcp
        │  (HTTP, loopback only)
        ▼
@@ -27,7 +30,12 @@
 [Host OS / Internet]  ← shell, filesystem, browser, email, cron, all of it
 ```
 
-OAuth 2.1 is the only authentication mechanism between Claude and the bridge. The static `client_id`/`client_secret` pair is the long-lived credential; access tokens minted from it are short-lived (1h) and live only in process memory. TLS is provided by the tunnel, not by hermes-mcp. Authorization (deciding whether a given prompt is acceptable) is delegated entirely to Hermes's approval hooks.
+There are two authentication paths between an MCP client and the bridge, in parallel on the same server:
+
+- **OAuth 2.1 with mandatory PKCE-S256 (public client).** Knowing `OAUTH_CLIENT_ID` plus completing the PKCE challenge is what authenticates. `OAUTH_CLIENT_SECRET` is accepted at `/token` for backward compatibility (Claude's connector UI still requires a value to send) but is **not enforced** server-side — see the design note below. Access tokens minted from this flow are short-lived (1h) and live only in process memory.
+- **Static bearer token** (`MCP_BEARER_TOKEN`, opt-in). Long-lived shared secret presented as `Authorization: Bearer <token>` on every `/mcp` request. Used by MCP clients whose UI exposes no OAuth flow (Codex desktop's custom-MCP form, Cursor's `headers` block). If this env var is unset, the bearer path is fully disabled.
+
+TLS is provided by the tunnel, not by hermes-mcp. Authorization (deciding whether a given prompt is acceptable) is delegated entirely to Hermes's approval hooks.
 
 The bridge talks to the gateway over **plaintext HTTP on the loopback interface**. The `HERMES_API_KEY` is sent as a Bearer token in cleartext on every request. This is fine because both endpoints live on the same host — but it is a real assumption: if you ever change `HERMES_API_URL` to a non-loopback target, the API key is on the wire.
 
@@ -41,12 +49,14 @@ The bridge talks to the gateway over **plaintext HTTP on the loopback interface*
 | `hermes-mcp` process | **Fully trusted** | This repo. Audit it. |
 | `hermes-gateway` process | **Fully trusted** | Separate process owned by the same user. The bridge has no sandbox around it. |
 | Tunnel edge (cloudflared / ngrok) | **Trusted for transport** | TLS terminates at the edge. We trust the provider not to MITM, replay, or read decrypted traffic. |
-| Access-token holder | **Authenticated, not fully trusted** | Anyone who presents a valid OAuth access token may call `hermes_ask`. They are not necessarily the human user. |
-| Claude Desktop / Mobile | **Trusted to authenticate** | Holds the OAuth `client_id` + `client_secret` and the resulting access tokens. Relays prompts from Claude.ai. |
-| Claude.ai (Anthropic's cloud) | **Trusted to authenticate, not to sanitize** | Controls what Claude "thinks" and therefore what prompts it sends. Not trusted to prevent prompt injection from Claude's context. |
+| Access-token holder | **Authenticated, not fully trusted** | Anyone who presents a valid OAuth access token (or, if configured, the static `MCP_BEARER_TOKEN`) may call `hermes_ask`. They are not necessarily the human user. |
+| MCP client app (Claude Desktop / Codex / Cursor / ...) | **Trusted to authenticate** | Holds the OAuth `client_id` + minted access tokens, or the static `MCP_BEARER_TOKEN`. Relays prompts from the LLM provider. |
+| LLM provider cloud (Claude.ai / OpenAI / ...) | **Trusted to authenticate, not to sanitize** | Controls what the model "thinks" and therefore what prompts it sends. Not trusted to prevent prompt injection from the chat context. |
 | Prompt content arriving at `hermes_ask` | **Untrusted input** | May contain injected instructions. |
 | Web content Hermes fetches | **Untrusted** | Not hermes-mcp's concern, but a live injection vector for Hermes. |
-| `~/.config/hermes-mcp/env` | **Sensitive** | Contains `OAUTH_CLIENT_SECRET` and `HERMES_API_KEY`. Must be mode 0600. |
+| `OAUTH_CLIENT_SECRET` | **Not a security gate** (despite name) | Accepted at `/token` for backward compatibility (Claude UI requires a value); server-side enforcement was removed when we switched to public-client OAuth. PKCE replaces it. Treat as a username, not a password. |
+| `MCP_BEARER_TOKEN` (if set) | **Sensitive credential** | Long-lived static bearer accepted at `/mcp`. Leak = full compromise on that path. Generated by `hermes-mcp mint-bearer-token`; min 32 chars enforced at config time. |
+| `~/.config/hermes-mcp/env` | **Sensitive** | Contains `HERMES_API_KEY` and optionally `MCP_BEARER_TOKEN`. Must be mode 0600. |
 
 ---
 
@@ -54,24 +64,24 @@ The bridge talks to the gateway over **plaintext HTTP on the loopback interface*
 
 ### 1. Unauthenticated callers
 
-Any request to `/mcp` missing a valid `Authorization: Bearer <access-token>` is rejected with 401 by the SDK's `RequireAuthMiddleware` before our tool function runs. Access tokens are minted only via the OAuth 2.1 authorization-code flow, which requires:
+Any request to `/mcp` missing a valid `Authorization: Bearer <token>` is rejected with 401 by the SDK's `RequireAuthMiddleware` before our tool function runs. Tokens are accepted via two paths, both gated by constant-time comparison:
 
-- knowledge of the long-lived `client_id` and `client_secret` (presented at `/token`),
-- a valid PKCE code-verifier matching the original code-challenge.
+- **OAuth-issued access tokens.** Minted only via the OAuth 2.1 authorization-code flow, which requires (a) knowledge of `OAUTH_CLIENT_ID`, and (b) **completing the PKCE-S256 challenge** — the `/token` exchange rejects any request whose `code_verifier`'s SHA-256 doesn't match the `code_challenge` originally sent to `/authorize`. The verifier is generated fresh by the legitimate client and never leaves it, so a captured code or `client_id` alone is not enough.
+- **Static bearer tokens.** If `MCP_BEARER_TOKEN` is configured, requests presenting that exact value succeed. Compared via `hmac.compare_digest`. First-use surfaces a single INFO-level audit log line per process.
 
-Both client-secret comparison (at `/token`) and access-token verification (at `/mcp`) use `hmac.compare_digest()`, eliminating timing-based extraction.
+**Residual risk (OAuth path):** Knowing `OAUTH_CLIENT_ID` is no longer hard (it's pasted into client configs and visible in browser history), so PKCE is doing the real work. PKCE protects against code interception but not against an attacker who controls the legitimate client's browser session in real time. The auto-approving `/authorize` design (single-user deployment, no consent UI) means anyone who can complete a full browser flow against your tunnel URL can mint a token — operators should never share the tunnel URL except with intended clients.
 
-**Residual risk:** If the `client_secret` is weak (short, guessable) or leaked, this protection collapses. `mint-client` generates a fresh ≥40-character `secrets.token_urlsafe` value; configuration enforces ≥32 characters. Rotate (`hermes-mcp mint-client`, restart) if exposed.
+**Residual risk (bearer path):** If `MCP_BEARER_TOKEN` is weak (short, guessable) or leaked, this protection collapses on that path. `hermes-mcp mint-bearer-token` generates a fresh ≥40-character `secrets.token_urlsafe` value; configuration enforces ≥32 characters. Rotate (`hermes-mcp mint-bearer-token`, edit env, `systemctl --user restart hermes-mcp`) if exposed. If your only client is on the OAuth path (Claude), leave `MCP_BEARER_TOKEN` unset — opting in adds a long-lived credential you don't need.
 
 ### 2. Authorization-code interception
 
-PKCE (S256, mandatory) binds each authorization code to a code-verifier known only to the legitimate client. Even if an attacker captures the code (via a logged URL, a malicious redirect target, etc.), they cannot exchange it without the matching verifier. Combined with `client_secret` at `/token`, two independent secrets must be compromised to mint a token.
+PKCE (S256, **mandatory**) binds each authorization code to a code-verifier known only to the legitimate client. Even if an attacker captures the code (via a logged URL, a malicious redirect target, a tunnel-provider compromise, etc.), they cannot exchange it without the matching verifier. This is the central protection of the public-client OAuth model — RFC 7636 was designed for exactly this case.
 
 Codes are single-use. The pop-then-mint sequence in `exchange_authorization_code` is atomic against concurrent exchanges, so a code cannot be redeemed twice. Codes expire 60 seconds after issuance.
 
 ### 3. Open-redirect abuse via `/authorize`
 
-`/authorize` redirects the browser to whatever `redirect_uri` the request supplies (the `redirect_uri` is later required to match at `/token`). PKCE + `client_secret` mean a stolen code cannot be exchanged, so substituting `redirect_uri` does not yield tokens — but it could still turn `/authorize` into an open redirector to dangerous schemes (`javascript:`, `file:`, `data:`).
+`/authorize` redirects the browser to whatever `redirect_uri` the request supplies (the `redirect_uri` is later required to match at `/token`). PKCE means a stolen code cannot be exchanged, so substituting `redirect_uri` does not yield tokens — but it could still turn `/authorize` into an open redirector to dangerous schemes (`javascript:`, `file:`, `data:`).
 
 `_StaticClient.validate_redirect_uri` enforces a scheme allowlist. The baseline (`https` and `http`-on-localhost) is always allowed; custom URI schemes are operator-configured via the `OAUTH_ALLOWED_REDIRECT_SCHEMES` env var (default `claude,claudeai,cursor`, with `vscode` and others added as new MCP clients are introduced). Any scheme not in the effective allowlist is rejected before the redirect is constructed. Operators who extend the allowlist are responsible for picking schemes that aren't themselves dangerous (`javascript`, `data`, `file`, ...).
 
@@ -93,13 +103,13 @@ Refresh tokens expire after 30 days.
 
 Prompt bodies are logged only at `DEBUG`. At the default `INFO` level, hermes-mcp logs only `endpoint`, `prompt_chars`, whether a session ID is present, and the timeout. Prompts do not appear in the systemd journal under normal operation.
 
-`client_secret`, authorization codes, access tokens, refresh tokens, and `HERMES_API_KEY` are never logged at any level. Token-mint events log only the TTL. The OAuth `state` parameter is client-controlled and is sanitized (newlines escaped, truncated to 64 chars) before logging to prevent log injection.
+`MCP_BEARER_TOKEN`, `OAUTH_CLIENT_SECRET`, authorization codes, access tokens, refresh tokens, and `HERMES_API_KEY` are never logged at any level. Token-mint events log only the TTL. First successful bearer-auth surfaces a single INFO line per process noting "first use" — the token value is not included. The OAuth `state` parameter is client-controlled and is sanitized (newlines escaped, truncated to 64 chars) before logging to prevent log injection.
 
 Gateway error response bodies are not echoed in the user-visible `HermesError` (only the status code is). This prevents a misbehaving or attacker-controlled gateway from injecting attacker bytes into the bridge's error responses to Claude. Bodies are still available at DEBUG.
 
 ### 8. Credential leakage via timing
 
-`hmac.compare_digest()` is used everywhere we compare secrets — `client_id` lookup in `get_client`, `client_secret` at `/token` (in the SDK), access-token lookup at `/mcp` (in the SDK). This eliminates the short-circuit behavior of naive string comparison.
+`hmac.compare_digest()` is used everywhere we compare secrets — `client_id` lookup in `get_client`, `MCP_BEARER_TOKEN` comparison in `load_access_token`, access-token lookup at `/mcp` (in the SDK). This eliminates the short-circuit behavior of naive string comparison. (The SDK still does an `hmac.compare_digest` check on `client_secret` when one is registered on the client, but our public-client setup registers `client_secret=None`, so that branch is dormant — see the design note below.)
 
 ### 9. DNS rebinding
 
@@ -125,9 +135,11 @@ hermes-mcp cannot reliably detect injection because it cannot distinguish Claude
 
 ### Weak or leaked credentials
 
-If the `client_secret` or `HERMES_API_KEY` is guessable, committed to a repository, pasted into a chat, or visible in an environment dump, hermes-mcp provides no additional protection. An attacker with the `client_secret` can mint access tokens at will. An attacker with the `HERMES_API_KEY` can call the gateway directly, bypassing the bridge entirely.
+If `MCP_BEARER_TOKEN` (when configured) or `HERMES_API_KEY` is guessable, committed to a repository, pasted into a chat, or visible in an environment dump, hermes-mcp provides no additional protection. An attacker with the bearer token can call `/mcp` directly. An attacker with the `HERMES_API_KEY` can call the gateway, bypassing the bridge entirely.
 
-Mitigations are operational: `0600` on `~/.config/hermes-mcp/env`, never commit the file, rotate (`hermes-mcp mint-client`, edit env, `systemctl --user restart hermes-mcp`) on any suspicion of exposure.
+Mitigations are operational: `0600` on `~/.config/hermes-mcp/env`, never commit the file, rotate (`hermes-mcp mint-bearer-token` for the bearer, edit `API_SERVER_KEY` in `~/.hermes/.env` for the gateway, `systemctl --user restart hermes-mcp`) on any suspicion of exposure.
+
+`OAUTH_CLIENT_SECRET` exposure is **not** in this category — the server doesn't enforce it. A leaked client_secret on its own does not let an attacker mint tokens. (It's still mildly preferable not to publish it — it could become enforced again in a future hardening release, and it's a signal of how seriously you treat operator-shared values — but losing one is not a security incident.)
 
 ### Compromise of the Hermes gateway
 
@@ -145,25 +157,33 @@ hermes-mcp does not inspect or restrict Hermes's network activity. If a prompt i
 
 ### Tunnel-provider compromise
 
-A compromised tunnel provider terminates TLS and forwards decrypted HTTP to `127.0.0.1:8765`. They can read prompt content in transit and replay or inject requests, subject to the bearer-auth check on `/mcp`. They cannot mint new tokens (no `client_secret`), but they can replay captured `/mcp` requests or submit their own with a valid access token they captured. Treat tunnel choice as a trust decision.
+A compromised tunnel provider terminates TLS and forwards decrypted HTTP to `127.0.0.1:8765`. They can read prompt content in transit and replay or inject requests, subject to the auth check on `/mcp`. PKCE means they cannot mint new OAuth tokens from a captured authorization code (the verifier never crosses the wire), but they can replay captured `/mcp` requests or submit their own with a valid access token (1h TTL) or — if you've configured `MCP_BEARER_TOKEN` — the bearer token (visible in `Authorization` headers the tunnel forwards). Treat tunnel choice as a trust decision.
 
 ---
 
 ## Adversary scenarios
 
-### Scenario A: Attacker obtains `OAUTH_CLIENT_SECRET`
+### Scenario A: Attacker obtains `MCP_BEARER_TOKEN` (when configured)
 
-**Impact:** Full `hermes_ask` access via the OAuth flow. The attacker can mint access tokens at will and call any tool the bridge exposes.
+**Impact:** Full `hermes_ask` access via the bearer-token path. The attacker calls `/mcp` directly with `Authorization: Bearer <token>` and invokes any tool the bridge exposes.
 
-**hermes-mcp's role:** None — `client_secret` is the long-lived credential.
+**hermes-mcp's role:** None — the bearer is a long-lived shared secret. Compromise of the bearer is compromise of the bridge on that path.
 
-**Mitigations:** Rotate immediately (`hermes-mcp mint-client`, update env, restart). Audit gateway logs for unexpected sessions. Consider whether `platform_toolsets.api_server` in Hermes config limits the damage.
+**Detection:** First-use bearer auth surfaces a single INFO log line per process. Subsequent uses are silent. A bearer token that's been in use for a while will not log on every call, so detection requires looking at `/mcp` request volume / IPs in the journal rather than the auth-event log.
+
+**Mitigations:** Rotate immediately (`hermes-mcp mint-bearer-token`, update env, restart). Audit gateway logs for unexpected sessions. Consider whether `platform_toolsets.api_server` in Hermes config limits the damage. If the bearer path was opt-in for a single client and that client no longer needs it, just unset `MCP_BEARER_TOKEN` and restart to disable the path entirely.
+
+### Scenario A′ (historical): Attacker obtains `OAUTH_CLIENT_SECRET`
+
+**Impact: none.** The server doesn't enforce `client_secret` (public-client OAuth, PKCE-only). A leaked client_secret on its own does not let an attacker mint tokens. They would also need to complete a PKCE flow against `/authorize` — which is its own gate (see Section 1 residual risk on tunnel-URL exposure).
+
+This scenario was Scenario A in the pre-v0.5 confidential-client design. Documented here so anyone looking at older deployments understands the change.
 
 ---
 
 ### Scenario B: Attacker obtains `HERMES_API_KEY`
 
-**Impact:** The attacker bypasses the bridge entirely and calls the gateway's `/v1/chat/completions` directly. Same effective capability as Scenario A. Distinct because they don't need to know the OAuth client_secret or the tunnel URL — they just need to be on the host (or its loopback namespace).
+**Impact:** The attacker bypasses the bridge entirely and calls the gateway's `/v1/chat/completions` directly. Same effective capability as Scenario A. Distinct because they don't need to know `MCP_BEARER_TOKEN`, complete a PKCE flow, or even know the tunnel URL — they just need to be on the host (or its loopback namespace).
 
 **hermes-mcp's role:** None — the gateway authenticates this directly.
 
@@ -190,8 +210,9 @@ Claude processes this as part of its context and may invoke `hermes_ask` with th
 If another process running as the same OS user can write the env file, they can:
 
 - swap `HERMES_API_URL` to point at an attacker-controlled server, harvesting every prompt and exfiltrating via crafted responses,
-- swap `OAUTH_ISSUER_URL` to a hostname they control (for the next OAuth flow Claude initiates),
-- swap `HERMES_API_KEY` to break the bridge while logging into theirs.
+- swap `OAUTH_ISSUER_URL` to a hostname they control (for the next OAuth flow a client initiates),
+- swap `HERMES_API_KEY` to break the bridge while logging into theirs,
+- if `MCP_BEARER_TOKEN` is set, read it and gain full bearer-path access.
 
 **hermes-mcp's role:** None. It trusts its config file.
 
@@ -225,9 +246,9 @@ An attacker who controls Claude.ai's inference can manipulate what Claude "think
 
 The tunnel provider terminates TLS and forwards decrypted HTTP to `localhost:8765`. They can read request bodies (including prompts) and replay or inject requests.
 
-**hermes-mcp's role:** Bearer auth still gates `/mcp`. A captured access token can be replayed for up to one hour. A captured `client_secret` (visible in `/token` POST bodies during a refresh) is a full compromise — but the tunnel only sees these if Claude Desktop is doing token refreshes in transit, which it does periodically.
+**hermes-mcp's role:** Bearer auth still gates `/mcp`. A captured OAuth access token can be replayed for up to one hour. A captured `MCP_BEARER_TOKEN` (if configured and visible in `Authorization` headers the tunnel forwards) is a full compromise on the bearer path. Authorization codes captured in transit are useless without the PKCE verifier (which never leaves the legitimate client).
 
-**Mitigations:** Rotate `client_secret` if you suspect provider compromise (which invalidates any refresh tokens minted under the old secret). Treat prompt content as visible to the tunnel.
+**Mitigations:** Rotate `MCP_BEARER_TOKEN` (`hermes-mcp mint-bearer-token`, restart) if you suspect provider compromise and you use the bearer path. The OAuth path is more robust here — PKCE means a captured `/token` request can't be replayed to mint a new pair, and access tokens expire in 1h. Treat prompt content as visible to the tunnel.
 
 ---
 
@@ -241,9 +262,11 @@ The tunnel provider terminates TLS and forwards decrypted HTTP to `localhost:876
 
 **HTTP-to-gateway, not subprocess.** Spawning a fresh `hermes` subprocess per call (the v0.1 design) was stateless: it didn't share skills, sessions, or live agent state with the gateway that drives Telegram. Routing through `/v1/chat/completions` gets Claude the same brain — but introduces a new local trust dependency on the gateway, which is acknowledged in Scenario E.
 
-**Auto-approve at `/authorize`.** Single-user deployment makes a consent UI noise. Security rests on `client_secret` + PKCE at `/token`, not on a click. The redirect-URI scheme allowlist (Section 3) prevents the open-redirect abuse this would otherwise enable.
+**Auto-approve at `/authorize`.** Single-user deployment makes a consent UI noise. Security rests on PKCE at `/token` and on the redirect-URI scheme allowlist (Section 3), not on a click.
 
-**In-memory token store.** Tokens are short-lived; no on-disk persistence means no exposure surface for token theft via filesystem reads, and restart-as-revocation is a useful primitive. The cost is that Claude has to re-auth on bridge restart — but this is silent because the long-lived `client_secret` survives.
+**Public-client OAuth (no `client_secret` enforcement).** The MCP ecosystem's clients have diverged on auth: Claude's UI requires a `client_secret` field; Codex CLI's only ships `client_id`. The original confidential-client setup served Claude but locked out Codex/Cursor. We switched to a PKCE-only public client — Claude still pastes and sends the secret (its UI requires it), the server ignores it, and Codex/Cursor work without changes. PKCE is what authenticates either way. `OAUTH_CLIENT_SECRET` survives in the env because removing the requirement would break Claude's connector UI for users who already have it pasted; treat it as a configuration artifact, not a credential.
+
+**In-memory token store.** Tokens are short-lived; no on-disk persistence means no exposure surface for token theft via filesystem reads, and restart-as-revocation is a useful primitive. The cost is that OAuth clients have to re-auth on bridge restart — but this is one click (Disconnect → Reconnect in Claude's UI) because `client_id` survives in the client's config.
 
 **`hmac.compare_digest` everywhere secrets are compared.** Python's `==` on strings short-circuits; `hmac.compare_digest` is constant-time over the input length.
 
@@ -253,7 +276,7 @@ The tunnel provider terminates TLS and forwards decrypted HTTP to `localhost:876
 
 hermes-mcp can only do so much. These are your responsibility:
 
-1. **Credential strength and secrecy.** Use `hermes-mcp mint-client` for OAuth credentials (≥40-char base64 secret). Use a strong `API_SERVER_KEY` for the gateway. Protect `~/.config/hermes-mcp/env` and `~/.hermes/.env` with mode 0600.
+1. **Credential strength and secrecy.** Use `hermes-mcp mint-bearer-token` for the bearer if you opt into the bearer path (≥40-char base64). Use a strong `API_SERVER_KEY` for the gateway. Protect `~/.config/hermes-mcp/env` and `~/.hermes/.env` with mode 0600. `OAUTH_CLIENT_SECRET` is not a real credential despite the name — but don't share it publicly either.
 2. **Hermes approval hooks.** Keep them on. Do not use `--yolo` for routine automation.
 3. **Toolset scoping.** `platform_toolsets.api_server` in the Hermes config limits what Hermes can be asked to do via this bridge. Set it deliberately.
 4. **OS hardening.** Run as a dedicated low-privilege user. Keep the host patched. The systemd unit ships with `NoNewPrivileges=true` and `PrivateTmp=true`; consider `ProtectSystem=strict`, `ProtectHome=read-only` (with `ReadWritePaths=` whitelisting `~/.config/hermes-mcp`), and an empty `CapabilityBoundingSet=` for defense-in-depth.

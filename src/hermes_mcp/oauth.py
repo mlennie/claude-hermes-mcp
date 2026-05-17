@@ -94,9 +94,9 @@ def _check_redirect_uri(redirect_uri: AnyUrl, allowed_schemes: frozenset[str]) -
 
     Permissive within sane bounds — we do not pin specific callback URIs
     because they are subject to change without notice across client
-    versions. PKCE + `client_secret` protect the actual token exchange;
-    this scheme check just prevents `javascript:` / `data:` / `file:`
-    style open-redirector abuse.
+    versions. PKCE protects the actual token exchange (mandatory
+    code_verifier check at /token); this scheme check just prevents
+    `javascript:` / `data:` / `file:` style open-redirector abuse.
     """
     scheme = (redirect_uri.scheme or "").lower()
     if scheme not in allowed_schemes:
@@ -120,10 +120,10 @@ class _StaticClient(OAuthClientInformationFull):
     subject to a scheme allowlist enforced by `_check_redirect_uri`.
 
     Validating the redirect_uri against a *pre-registered list* is not
-    useful here: we have one client whose `client_secret` is required at
-    /token, and we have PKCE binding the code to the original
-    code_challenge. An attacker who substitutes a redirect_uri cannot
-    exchange the code without both secrets.
+    useful here: PKCE binds the authorization code to the original
+    code_challenge, so an attacker who substitutes a redirect_uri cannot
+    exchange the code without the matching code_verifier (which never
+    leaves the legitimate client).
 
     Validating the redirect_uri's *scheme* is, however, useful: without it
     `/authorize` would happily redirect to `javascript:` or `data:` URIs
@@ -168,6 +168,10 @@ class StaticClientProvider(
     refresh_token_ttl: int = DEFAULT_REFRESH_TOKEN_TTL
 
     def __post_init__(self) -> None:
+        # `self.client_secret` is kept required at construction time for
+        # backward-compat with deployments that already have OAUTH_CLIENT_SECRET
+        # set, and because Claude Desktop's UI still requires a value to paste.
+        # It is NOT used for auth — see the module docstring; PKCE is the gate.
         if not self.client_id or not self.client_secret:
             raise ValueError("client_id and client_secret are required")
         # Baseline (`https`, `http`-on-localhost) is always allowed alongside

@@ -1,6 +1,6 @@
 # hermes-mcp
 
-> An MCP server that lets **Claude Desktop**, **Claude.ai (web + mobile)**, **OpenAI Codex desktop**, and any other MCP client (via OAuth 2.1 or static bearer token) delegate tasks to a local **[Hermes Agent](https://github.com/hermes-agent/hermes-agent)** running on your own hardware. (See [Client compatibility](#client-compatibility) for the current matrix.)
+> An MCP server that lets **Claude Desktop**, **Claude.ai (web + mobile)**, **OpenAI Codex desktop**, **Cursor**, and any other MCP client (via OAuth 2.1 or static bearer token) delegate tasks to a local **[Hermes Agent](https://github.com/hermes-agent/hermes-agent)** running on your own hardware. (See [Client compatibility](#client-compatibility) for the current matrix.)
 
 Use Claude (or another supported MCP client) as your daily chat. When you ask for something Hermes is built for — scheduling cron jobs, browser automation, email, document creation, persistent skills, WhatsApp/Slack messaging — your client calls Hermes through this bridge.
 
@@ -101,14 +101,31 @@ Pick whichever the client's UI supports — both auth paths coexist on the same 
 |---|---|---|
 | **Claude Desktop / Claude.ai (web + mobile)** | OAuth | Settings → Connectors → Add custom connector → paste the server URL + your `OAUTH_CLIENT_ID` + your `OAUTH_CLIENT_SECRET`. (The secret is accepted but no longer enforced server-side; the field is still required by Claude's UI, so set it.) |
 | **OpenAI Codex desktop** | Bearer | Settings → MCP → Connect to a custom MCP → Streamable HTTP → URL = your tunnel + `/mcp`, **Bearer token env var** = name of an OS env var on your laptop that holds your `MCP_BEARER_TOKEN` value. Restart Codex desktop after setting the env var so it's inherited. Skips OAuth entirely. |
+| **Cursor** | Bearer | Settings → MCP → Add custom MCP → paste the JSON below into `~/.cursor/mcp.json`. No OAuth flow, no extra config. |
+
+#### Cursor — exact `~/.cursor/mcp.json` snippet
+
+```json
+{
+  "mcpServers": {
+    "hermes": {
+      "url": "https://hermes.claude-hermes-mcp.com/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-MCP_BEARER_TOKEN>"
+      }
+    }
+  }
+}
+```
+
+Replace `<your-MCP_BEARER_TOKEN>` with the token printed by `hermes-mcp mint-bearer-token`. The token sits in your laptop's `~/.cursor/mcp.json` (file-mode protected by your OS); if you'd rather not have it there in cleartext, use `"Authorization": "Bearer ${env:HERMES_MCP_BEARER}"` and set the env var on your OS instead. Save the file and Cursor picks it up automatically — no restart needed.
 
 ### Untested (likely workable via bearer)
 
-These clients all support setting custom request headers, which is enough to drive the bearer-token path. We haven't tested them end-to-end yet — if you connect one, please [open an issue](https://github.com/mlennie/hermes-mcp/issues) with your config so we can promote it.
+These clients all support setting custom request headers, which should be enough to drive the bearer-token path. We haven't tested them end-to-end — if you connect one, please [open an issue](https://github.com/mlennie/hermes-mcp/issues) with your config so we can promote it.
 
 | Client | Likely auth | Where to set it |
 |---|---|---|
-| **Cursor** | Bearer via `headers` | `~/.cursor/mcp.json` → `"headers": { "Authorization": "Bearer ${env:MCP_BEARER_TOKEN}" }` |
 | **Continue (VSCode)** | Bearer via `requestOptions.headers` | `continue` config: `requestOptions.headers.Authorization = "Bearer ..."` |
 | **OpenAI Codex CLI** | OAuth (PKCE) | `~/.codex/config.toml` → `[mcp_servers.hermes.oauth] client_id = "..."`. **Caveat:** Codex CLI's OAuth flow uses a localhost callback on whichever machine `codex` runs on; if you SSH from a laptop into the mini-PC where hermes-mcp lives, the laptop browser can't reach that callback. Easiest workaround is to use the desktop app (above) instead. |
 
@@ -343,6 +360,7 @@ Restart after editing the env file: `systemctl --user restart hermes-mcp`.
 | `cloudflared` tunnel | Starts at boot. ✅ |
 | Tunnel URL | Stable (named tunnel). ✅ |
 | OAuth `client_id` / `client_secret` | Read from `~/.config/hermes-mcp/env` at startup. ✅ |
+| `MCP_BEARER_TOKEN` (if set) | Read from `~/.config/hermes-mcp/env` at startup. ✅ |
 | Live OAuth access / refresh tokens | **Stored in memory only — lost on every restart.** ❌ |
 
 **Practical impact:** the host can reboot freely; the bridge comes back up on the same URL. But Claude Desktop is holding access and refresh tokens that are now invalid (the in-memory store they were minted from is gone). On the next call, Claude usually reports `"Error occurred during tool execution"` rather than transparently re-running OAuth.
@@ -361,13 +379,16 @@ This is a known limitation of the in-memory token store. Persisting tokens to di
 
 - **Do not run Hermes with `--yolo`.** Keep approval hooks on.
 - **Scope `platform_toolsets.api_server`** in your Hermes config to the minimum toolset your use case needs (see [What Claude sees](#hermes_askprompt-session_id-toolsets)).
-- **The OAuth `client_secret` and `HERMES_API_KEY` are credentials.** A leaked `client_secret` lets an attacker mint access tokens against your bridge; a leaked `HERMES_API_KEY` lets them bypass the bridge and call the gateway directly. Rotate (`hermes-mcp mint-client` for OAuth; edit `API_SERVER_KEY` in `~/.hermes/.env` for the gateway) if exposed.
+- **`MCP_BEARER_TOKEN` (if set) and `HERMES_API_KEY` are the long-lived credentials.** The bearer token, if configured, is the only gate behind the tunnel URL for clients on that path — a leak is equivalent to remote action execution on your host. `HERMES_API_KEY` lets an attacker bypass the bridge and call the gateway directly. Rotate (`hermes-mcp mint-bearer-token` for the bearer; edit `API_SERVER_KEY` in `~/.hermes/.env` for the gateway) if exposed.
+- **`OAUTH_CLIENT_SECRET` is *not* a security gate.** Despite the name, it's accepted at `/token` for backward compatibility (Claude's UI requires a value to send) but not enforced server-side. PKCE — specifically the mandatory `code_verifier` check at every authorization-code exchange — is what protects token issuance. Leaking `OAUTH_CLIENT_SECRET` does not on its own let an attacker mint access tokens. Treat it as you would a username, not a password.
 - **Prompt injection is real.** A malicious prompt slipping into Claude's context (via a webpage, a file you pasted) can craft tool calls. Hermes's own approval hooks are your last line of defense — keep them on.
 
 Code-side mitigations baked in:
 
-- OAuth 2.1 with mandatory PKCE-S256. `client_secret` comparison via `hmac.compare_digest`. Authorization codes are single-use with atomic pop-on-exchange; refresh tokens rotate atomically and approximate RFC 6819 reuse detection.
-- `redirect_uri` scheme allowlist on `/authorize` (https, http-on-localhost, claude, claudeai) prevents the bridge becoming an open redirector to `javascript:` / `data:` URIs.
+- OAuth 2.1 with **mandatory PKCE-S256** (server enforces `code_verifier` on every authorization-code exchange; mismatch returns `invalid_grant`). Server registered as a **public client** (`token_endpoint_auth_method=none`), so `client_secret` is not part of the auth contract — PKCE is the dynamic per-exchange secret.
+- Static bearer-token path (`MCP_BEARER_TOKEN`) compared in constant time via `hmac.compare_digest`. First use logs a single INFO-level audit line per process.
+- Authorization codes are single-use with atomic pop-on-exchange; refresh tokens rotate atomically and approximate RFC 6819 reuse detection.
+- `redirect_uri` scheme allowlist on `/authorize` (https, http-on-localhost, claude, claudeai, cursor; configurable via `OAUTH_ALLOWED_REDIRECT_SCHEMES`) prevents the bridge becoming an open redirector to `javascript:` / `data:` URIs.
 - Access tokens are 256-bit `secrets.token_urlsafe`, expire after 1 hour, live only in memory (no on-disk persistence). Refresh tokens 30d, also in memory.
 - DNS-rebinding protection via `MCP_ALLOWED_HOSTS` enforced at the transport layer.
 - Prompt bodies and gateway response bodies logged only at `DEBUG`. INFO logs are endpoint + length + session_id + duration only. The OAuth `state` parameter is sanitized before logging.
@@ -378,7 +399,7 @@ Code-side mitigations baked in:
 
 - **`hermes-mcp doctor` reports "hermes gateway unreachable"** → the gateway isn't running. `systemctl --user status hermes-gateway` will tell you why.
 - **`doctor` reports "rejected the API key (401)"** → `HERMES_API_KEY` doesn't match `API_SERVER_KEY` in `~/.hermes/.env`. Update one or the other and restart.
-- **Connector stuck on "Verifying"** → 9 times out of 10 it's a wrong `client_id` or `client_secret`, or `OAUTH_ISSUER_URL` doesn't match the URL you pasted into Claude. They must be the same hostname.
+- **Connector stuck on "Verifying"** → most often it's a wrong `client_id` or `OAUTH_ISSUER_URL` not matching the URL you pasted into Claude (they must be the same hostname). The `client_secret` value doesn't matter to the server but Claude won't submit the form without one — paste anything ≥1 char.
 - **"Invalid Host header" / 421** → your tunnel hostname isn't in `MCP_ALLOWED_HOSTS`. Add it (comma-separated) and restart.
 - **Cloudflared 502** → `hermes-mcp` isn't running. `journalctl --user -u hermes-mcp` will tell you why.
 - **After a reboot or `systemctl --user restart hermes-mcp`, Claude says "Error occurred during tool execution"** → expected. OAuth tokens are in-memory; restarting the bridge invalidates them. **Fix:** in Claude Desktop, Settings → Connectors → your hermes-mcp connector → Disconnect → Reconnect. The `client_id`/`client_secret` are saved, so Claude re-auths in a few seconds. See [What survives a reboot](#what-survives-a-reboot).
