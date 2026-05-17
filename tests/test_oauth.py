@@ -49,12 +49,19 @@ def test_constructor_rejects_empty_credentials() -> None:
         StaticClientProvider(client_id=CLIENT_ID, client_secret="")
 
 
-def test_get_client_returns_static_client() -> None:
+def test_get_client_returns_static_client_as_public_pkce_only() -> None:
+    """The registered client is a public client: `client_secret=None` and
+    `token_endpoint_auth_method="none"`. This lets the SDK skip the
+    client_secret check at /token (`mcp/server/auth/middleware/client_auth.py`
+    branches on `client.client_secret` being truthy) while keeping PKCE
+    mandatory. This is what unlocks Codex CLI / Cursor, whose MCP OAuth
+    configs only carry `client_id`."""
     p = _provider()
     client = asyncio.run(p.get_client(CLIENT_ID))
     assert client is not None
     assert client.client_id == CLIENT_ID
-    assert client.client_secret == CLIENT_SECRET
+    assert client.client_secret is None
+    assert client.token_endpoint_auth_method == "none"
 
 
 def test_get_client_unknown_returns_none() -> None:
@@ -145,7 +152,7 @@ def test_validate_redirect_uri_default_claude_schemes_rejected_under_custom_conf
 
 def test_validate_redirect_uri_rejects_dangerous_schemes() -> None:
     """The /authorize redirect must not become an open redirector to javascript:
-    or data: URIs even though PKCE + client_secret protect token exchange."""
+    or data: URIs even though PKCE protects token exchange."""
     p = _provider()
     client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
     for evil in (

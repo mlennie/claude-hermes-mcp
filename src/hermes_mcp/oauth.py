@@ -6,11 +6,23 @@ an OAuth 2.1 authorization server in front of the MCP endpoint. For a
 personal bridge there is exactly one client and exactly one user, so this
 provider:
 
-  - holds a single static (client_id, client_secret) pair, configured via env
-  - auto-approves the /authorize step (security rests on the client_secret
-    + PKCE binding at the /token exchange, not on a UI consent step)
+  - holds a single static `client_id`, configured via env
+  - registers the client as a **public client** with
+    `token_endpoint_auth_method="none"` (no `client_secret`). PKCE is
+    mandatory; the SDK enforces it on every authorization-code exchange
+    (`mcp/server/auth/handlers/token.py:174-185`). Without PKCE the request
+    is rejected with `invalid_grant`, so the dynamic per-exchange
+    `code_verifier` is what actually protects token issuance.
+  - auto-approves the /authorize step
   - mints opaque random access and refresh tokens, stored in memory
   - has no persistence: tokens evaporate on restart, the client just re-auths
+
+`OAUTH_CLIENT_SECRET` is still required at startup for backward
+compatibility (Claude Desktop / Claude.ai have it pasted in their connector
+UI and will keep sending it). The server simply ignores the value at the
+/token exchange — PKCE is the real gate. Codex CLI and Cursor, which only
+support PKCE-style public clients (`McpServerOAuthConfig` has no
+`client_secret` field), now work without changes.
 
 Dynamic Client Registration is intentionally disabled. Anyone hitting
 /register is told it is unsupported.
@@ -154,13 +166,19 @@ class StaticClientProvider(
         effective_schemes = _BASELINE_SCHEMES | frozenset(
             s.lower() for s in self.allowed_redirect_schemes
         )
+        # Public client (PKCE-only). `client_secret=None` + auth method `"none"`
+        # makes the SDK skip the secret check at /token (`client_auth.py:93-104`),
+        # while PKCE remains mandatory (`token.py:26, 174-185`). This is what
+        # lets Codex CLI / Cursor — which only ship `client_id` in their MCP
+        # config — complete the OAuth flow. Claude Desktop still pastes a
+        # client_secret in its UI; the server reads it but doesn't enforce it.
         self._client = _StaticClient(
             client_id=self.client_id,
-            client_secret=self.client_secret,
+            client_secret=None,
             redirect_uris=[AnyUrl("http://localhost/")],  # placeholder; we override validation
             grant_types=["authorization_code", "refresh_token"],
             response_types=["code"],
-            token_endpoint_auth_method="client_secret_post",  # noqa: S106 — RFC 6749 method name, not a secret
+            token_endpoint_auth_method="none",  # noqa: S106 — RFC 7591 method name, not a secret
         )
         # PrivateAttr can't be set via constructor in Pydantic v2; assign here.
         self._client._allowed_redirect_schemes = effective_schemes
@@ -177,7 +195,9 @@ class StaticClientProvider(
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         raise NotImplementedError(
             "Dynamic client registration is disabled. Configure OAUTH_CLIENT_ID "
-            "and OAUTH_CLIENT_SECRET on the server and paste them into your client."
+            "on the server and paste it into your MCP client's OAuth config. "
+            "Claude Desktop also requires OAUTH_CLIENT_SECRET in its connector UI "
+            "(the server accepts but does not enforce it; PKCE is the real gate)."
         )
 
     async def authorize(

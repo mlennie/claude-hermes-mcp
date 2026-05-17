@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Server is now a public OAuth client (PKCE-only).** The registered
+  client uses `token_endpoint_auth_method="none"` and `client_secret=None`,
+  so the SDK no longer validates `client_secret` at `/token` — PKCE is the
+  enforcing gate (mandatory `code_verifier` check at every authorization
+  code exchange). This unblocks Codex CLI and Cursor: their MCP OAuth
+  config schemas only carry `client_id` (no `client_secret` field exists),
+  and they were unable to complete the exchange against the previous
+  confidential-client setup.
+- Existing Claude Desktop / Claude.ai connector setups continue to work
+  with **no config change required**. Claude still pastes the
+  `client_secret` in its UI and sends it in the `/token` form; the server
+  reads it and ignores it. The `OAUTH_CLIENT_SECRET` env var stays
+  required at startup so existing deployments are not forced to migrate
+  (and so Claude's connector form still has a value to send).
+- Tool description for the no-longer-implemented `/register` endpoint now
+  mentions that only `OAUTH_CLIENT_ID` is needed for Codex/Cursor-style
+  clients; `OAUTH_CLIENT_SECRET` is only meaningful for Claude.
+
+### Security
+- **Threat-model delta**: the access gate is now (a) knowing the issuer
+  URL, (b) knowing a valid `client_id`, and (c) completing the PKCE
+  challenge. The `client_secret` is no longer a gate. PKCE was designed
+  by RFC 7636 specifically to obviate `client_secret` for public clients,
+  so this matches every mobile / SPA OAuth deployment. The auto-approving
+  `/authorize` endpoint and the redirect-URI scheme allowlist remain the
+  defense against open-redirector abuse.
+
 ## [0.4.0] - 2026-05-17
 
 ### Added
