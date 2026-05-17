@@ -22,7 +22,8 @@ def _mint_client() -> int:
     print(f"OAUTH_CLIENT_ID={client_id}")
     print(f"OAUTH_CLIENT_SECRET={client_secret}")
     print()
-    print("# Then in Claude Desktop > Settings > Connectors > Add custom connector:")
+    print("# Then in your MCP client (Claude Desktop > Settings > Connectors,")
+    print("# Codex CLI's ~/.codex/config.toml, Cursor's ~/.cursor/mcp.json, ...):")
     print("#   URL:           https://<your-tunnel-host>/mcp")
     print(f"#   Client ID:     {client_id}")
     print(f"#   Client Secret: {client_secret}")
@@ -32,7 +33,7 @@ def _mint_client() -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="hermes-mcp",
-        description="MCP bridge for delegating tasks from Claude to a local Hermes Agent.",
+        description="MCP bridge for delegating tasks from any MCP client to a local Hermes Agent.",
     )
     parser.add_argument("--version", action="version", version=f"hermes-mcp {__version__}")
     parser.add_argument(

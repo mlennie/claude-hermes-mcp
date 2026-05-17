@@ -22,8 +22,11 @@ def test_mint_client_prints_credentials(capsys: pytest.CaptureFixture[str]) -> N
     out = capsys.readouterr().out
     assert "OAUTH_CLIENT_ID=hermes-mcp-" in out
     assert "OAUTH_CLIENT_SECRET=" in out
-    # Should also include the Claude Desktop paste-block hint.
-    assert "custom connector" in out.lower()
+    # Should include a hint pointing at MCP clients to paste these into.
+    lowered = out.lower()
+    assert "mcp client" in lowered
+    # Mention at least one specific client to make the hint actionable.
+    assert any(c in lowered for c in ("claude desktop", "codex", "cursor"))
 
 
 def test_missing_required_env_returns_2(

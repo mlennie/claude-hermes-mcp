@@ -1,8 +1,10 @@
 """Single-user OAuth 2.1 authorization server provider.
 
-The MCP transport spec (and Claude Desktop's Custom Connector UI) require an
-OAuth 2.1 authorization server in front of the MCP endpoint. For a personal
-bridge there is exactly one client and exactly one user, so this provider:
+The MCP transport spec (and most MCP client UIs that add a remote server,
+including Claude Desktop's Custom Connector, Codex CLI, and Cursor) require
+an OAuth 2.1 authorization server in front of the MCP endpoint. For a
+personal bridge there is exactly one client and exactly one user, so this
+provider:
 
   - holds a single static (client_id, client_secret) pair, configured via env
   - auto-approves the /authorize step (security rests on the client_secret
@@ -41,7 +43,7 @@ from mcp.shared.auth import (
     OAuthClientInformationFull,
     OAuthToken,
 )
-from pydantic import AnyUrl
+from pydantic import AnyUrl, PrivateAttr
 
 logger = logging.getLogger(__name__)
 
@@ -53,28 +55,39 @@ AUTHORIZATION_CODE_TTL = 60  # 1 minute (RFC 6749 §4.1.2 recommends short)
 MAX_OUTSTANDING_AUTH_CODES = 1024
 MAX_OUTSTANDING_ACCESS_TOKENS = 4096
 
-# Redirect-URI schemes the bridge will accept. PKCE + client_secret protect
-# the token exchange, but `/authorize` redirects out to whatever URI the
-# request specifies — we should not let that be a `javascript:`, `file:`,
-# or `data:` URL or anything else that would turn this endpoint into an
-# open redirector to dangerous schemes.
-_ALLOWED_REDIRECT_SCHEMES = frozenset(
-    {
-        "https",
-        "http",  # only honored for localhost; see _check_redirect_uri
-        "claude",
-        "claudeai",
-    }
-)
+# Redirect-URI schemes the bridge ALWAYS accepts as a security baseline.
+# `https` is the standard for hosted MCP clients; `http` is only honored
+# for localhost (enforced below) so testing and the doctor flow work.
+# These are the schemes that cannot turn `/authorize` into an open
+# redirector to dangerous targets.
+_BASELINE_SCHEMES: frozenset[str] = frozenset({"https", "http"})
+
+# Default custom URI schemes the bridge accepts on top of the baseline. Each
+# entry corresponds to an MCP client's OAuth redirect-URI scheme. Operators
+# extend or override this via `OAUTH_ALLOWED_REDIRECT_SCHEMES` for additional
+# clients (e.g. `vscode` for Continue). Re-exported from `config.py` so the
+# server default and the env-var default cannot drift apart.
+DEFAULT_ALLOWED_REDIRECT_SCHEMES: frozenset[str] = frozenset({"claude", "claudeai", "cursor"})
 
 
-def _check_redirect_uri(redirect_uri: AnyUrl) -> None:
+def _check_redirect_uri(redirect_uri: AnyUrl, allowed_schemes: frozenset[str]) -> None:
     """Reject schemes/hosts that would turn the OAuth flow into an open
-    redirector to dangerous targets. Permissive within sane bounds — we
-    do not pin specific Claude callback URIs because they are subject to
-    change without notice."""
+    redirector to dangerous targets.
+
+    `allowed_schemes` is the union of the baseline (`https`, `http`-on-
+    localhost) and any custom URI schemes the operator configured via
+    `OAUTH_ALLOWED_REDIRECT_SCHEMES`. Each MCP client uses its own custom
+    scheme (`claude`, `claudeai`, `cursor`, `vscode`, ...); the operator
+    adds to the configured list as needed for new clients.
+
+    Permissive within sane bounds — we do not pin specific callback URIs
+    because they are subject to change without notice across client
+    versions. PKCE + `client_secret` protect the actual token exchange;
+    this scheme check just prevents `javascript:` / `data:` / `file:`
+    style open-redirector abuse.
+    """
     scheme = (redirect_uri.scheme or "").lower()
-    if scheme not in _ALLOWED_REDIRECT_SCHEMES:
+    if scheme not in allowed_schemes:
         raise InvalidRedirectUriError(f"redirect_uri scheme {scheme!r} is not allowed")
     if scheme == "http" and redirect_uri.host not in ("localhost", "127.0.0.1", "::1"):
         raise InvalidRedirectUriError("redirect_uri scheme 'http' is only allowed for localhost")
@@ -103,12 +116,21 @@ class _StaticClient(OAuthClientInformationFull):
     Validating the redirect_uri's *scheme* is, however, useful: without it
     `/authorize` would happily redirect to `javascript:` or `data:` URIs
     on request, turning the endpoint into an open redirector.
+
+    `_allowed_redirect_schemes` is the union of the baseline (`https`,
+    `http`-on-localhost) and the operator-configured custom schemes
+    (defaulting to `claude`, `claudeai`, `cursor`). Operators extend the
+    list via `OAUTH_ALLOWED_REDIRECT_SCHEMES` for new MCP clients.
+    Stored as a Pydantic `PrivateAttr` so it does not appear in the
+    serialized model and isn't passed across the wire.
     """
+
+    _allowed_redirect_schemes: frozenset[str] = PrivateAttr(default_factory=frozenset)
 
     def validate_redirect_uri(self, redirect_uri: AnyUrl | None) -> AnyUrl:
         if redirect_uri is None:
             raise InvalidRedirectUriError("redirect_uri is required")
-        _check_redirect_uri(redirect_uri)
+        _check_redirect_uri(redirect_uri, self._allowed_redirect_schemes)
         return redirect_uri
 
 
@@ -120,12 +142,18 @@ class StaticClientProvider(
 
     client_id: str
     client_secret: str
+    allowed_redirect_schemes: frozenset[str] = DEFAULT_ALLOWED_REDIRECT_SCHEMES
     access_token_ttl: int = DEFAULT_ACCESS_TOKEN_TTL
     refresh_token_ttl: int = DEFAULT_REFRESH_TOKEN_TTL
 
     def __post_init__(self) -> None:
         if not self.client_id or not self.client_secret:
             raise ValueError("client_id and client_secret are required")
+        # Baseline (`https`, `http`-on-localhost) is always allowed alongside
+        # the operator-configured custom schemes — see _check_redirect_uri.
+        effective_schemes = _BASELINE_SCHEMES | frozenset(
+            s.lower() for s in self.allowed_redirect_schemes
+        )
         self._client = _StaticClient(
             client_id=self.client_id,
             client_secret=self.client_secret,
@@ -134,6 +162,8 @@ class StaticClientProvider(
             response_types=["code"],
             token_endpoint_auth_method="client_secret_post",  # noqa: S106 — RFC 6749 method name, not a secret
         )
+        # PrivateAttr can't be set via constructor in Pydantic v2; assign here.
+        self._client._allowed_redirect_schemes = effective_schemes
         self._auth_codes: dict[str, AuthorizationCode] = {}
         self._access_tokens: dict[str, AccessToken] = {}
         self._refresh_tokens: dict[str, RefreshToken] = {}
@@ -257,7 +287,7 @@ class StaticClientProvider(
         resource: str | None,
     ) -> OAuthToken:
         # Cap outstanding tokens. Under normal operation every token here is
-        # live (Claude refreshes well before expiry); hitting this means
+        # live (MCP clients refresh well before expiry); hitting this means
         # something is wrong (a runaway client) and refusing is the right call.
         if len(self._access_tokens) >= MAX_OUTSTANDING_ACCESS_TOKENS:
             self._reap_expired_access_tokens()

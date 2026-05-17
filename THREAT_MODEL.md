@@ -73,7 +73,7 @@ Codes are single-use. The pop-then-mint sequence in `exchange_authorization_code
 
 `/authorize` redirects the browser to whatever `redirect_uri` the request supplies (the `redirect_uri` is later required to match at `/token`). PKCE + `client_secret` mean a stolen code cannot be exchanged, so substituting `redirect_uri` does not yield tokens — but it could still turn `/authorize` into an open redirector to dangerous schemes (`javascript:`, `file:`, `data:`).
 
-`_StaticClient.validate_redirect_uri` enforces a scheme allowlist: `https`, `http` (only for localhost), `claude`, and `claudeai`. Any other scheme is rejected before the redirect is constructed.
+`_StaticClient.validate_redirect_uri` enforces a scheme allowlist. The baseline (`https` and `http`-on-localhost) is always allowed; custom URI schemes are operator-configured via the `OAUTH_ALLOWED_REDIRECT_SCHEMES` env var (default `claude,claudeai,cursor`, with `vscode` and others added as new MCP clients are introduced). Any scheme not in the effective allowlist is rejected before the redirect is constructed. Operators who extend the allowlist are responsible for picking schemes that aren't themselves dangerous (`javascript`, `data`, `file`, ...).
 
 ### 4. Refresh-token replay
 

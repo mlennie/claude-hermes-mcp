@@ -6,7 +6,7 @@ name: Release
 #
 # One-time setup on PyPI (per project, https://pypi.org/manage/project/hermes-mcp/settings/publishing/):
 #   - Owner:               mlennie
-#   - Repository name:     claude-hermes-mcp
+#   - Repository name:     hermes-mcp
 #   - Workflow filename:   release.yml
 #   - Environment name:    (leave blank, or set to `release` if you also
 #                          create a GitHub environment with that name)

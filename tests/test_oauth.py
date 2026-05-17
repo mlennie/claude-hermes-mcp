@@ -83,12 +83,64 @@ def test_validate_redirect_uri_allows_expected_schemes() -> None:
     client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
     # Public-suffix HTTPS URLs.
     assert client.validate_redirect_uri(AnyUrl("https://app.example.com/cb")) is not None
-    # Claude Desktop's private-use schemes.
+    # Default custom schemes covering Claude Desktop / Claude.ai / Cursor.
     assert client.validate_redirect_uri(AnyUrl("claude://oauth/callback")) is not None
     assert client.validate_redirect_uri(AnyUrl("claudeai://oauth/callback")) is not None
+    assert client.validate_redirect_uri(AnyUrl("cursor://anysphere.cursor-mcp/cb")) is not None
     # http only on localhost.
     assert client.validate_redirect_uri(AnyUrl("http://localhost:9999/x")) is not None
     assert client.validate_redirect_uri(AnyUrl("http://127.0.0.1:9999/x")) is not None
+
+
+def test_validate_redirect_uri_rejects_scheme_not_in_default_allowlist() -> None:
+    """A custom scheme not in the default set (e.g. `vscode://`) is rejected
+    unless the operator adds it to OAUTH_ALLOWED_REDIRECT_SCHEMES."""
+    p = _provider()
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    with pytest.raises(InvalidRedirectUriError, match="not allowed"):
+        client.validate_redirect_uri(AnyUrl("vscode://continue.continue/oauth/callback"))
+
+
+def test_validate_redirect_uri_accepts_custom_scheme_when_configured() -> None:
+    """Operator adds `vscode` to OAUTH_ALLOWED_REDIRECT_SCHEMES → accepted."""
+    p = StaticClientProvider(
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        allowed_redirect_schemes=frozenset({"vscode"}),
+    )
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    assert (
+        client.validate_redirect_uri(AnyUrl("vscode://continue.continue/oauth/callback"))
+        is not None
+    )
+
+
+def test_validate_redirect_uri_baseline_always_allowed_regardless_of_config() -> None:
+    """`https` and `http`-on-localhost are baseline schemes; they're allowed
+    even if the operator configures an allowlist that excludes them. This is
+    the security floor for Codex CLI's HTTPS callbacks and for local testing."""
+    p = StaticClientProvider(
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        allowed_redirect_schemes=frozenset({"vscode"}),  # deliberately omits https/http
+    )
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    assert client.validate_redirect_uri(AnyUrl("https://app.example.com/cb")) is not None
+    assert client.validate_redirect_uri(AnyUrl("http://localhost:9999/cb")) is not None
+
+
+def test_validate_redirect_uri_default_claude_schemes_rejected_under_custom_config() -> None:
+    """If the operator explicitly configures schemes without `claude`/`claudeai`,
+    those schemes are no longer accepted — the env var fully replaces the
+    default custom-scheme list (baseline stays intact)."""
+    p = StaticClientProvider(
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        allowed_redirect_schemes=frozenset({"cursor"}),  # only cursor; no claude
+    )
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    with pytest.raises(InvalidRedirectUriError, match="not allowed"):
+        client.validate_redirect_uri(AnyUrl("claude://oauth/callback"))
 
 
 def test_validate_redirect_uri_rejects_dangerous_schemes() -> None:
