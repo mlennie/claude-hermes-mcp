@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-17
+
 ### Added
 - **`hermes_reset()` tool.** Clears every job from the in-memory `JobStore`
   in one call, returning JSON like `{"cleared": 4, "by_status": {"running": 1, "pending": 3}}`.
@@ -152,7 +154,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - systemd units for `hermes-mcp`, cloudflared, and ngrok in `deploy/`.
 - README with architecture diagram, threat model, and tunnel setup walkthroughs.
 
-[Unreleased]: https://github.com/mlennie/hermes-mcp/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/mlennie/hermes-mcp/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/mlennie/hermes-mcp/releases/tag/v0.4.0
 [0.3.0]: https://github.com/mlennie/hermes-mcp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/mlennie/hermes-mcp/releases/tag/v0.2.0
 [0.1.0]: https://github.com/mlennie/hermes-mcp/releases/tag/v0.1.0
