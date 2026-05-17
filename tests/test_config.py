@@ -169,3 +169,28 @@ def test_allowed_redirect_schemes_comma_only_falls_back_to_default() -> None:
     for raw in (",", ",,,", " , , ,"):
         cfg = Config.from_env({**VALID_BASE, "OAUTH_ALLOWED_REDIRECT_SCHEMES": raw})
         assert cfg.allowed_redirect_schemes == ("claude", "claudeai", "cursor"), raw
+
+
+# --- MCP_BEARER_TOKEN --------------------------------------------
+
+
+def test_bearer_token_optional_defaults_to_none() -> None:
+    cfg = Config.from_env(VALID_BASE)
+    assert cfg.mcp_bearer_token is None
+
+
+def test_bearer_token_parsed_when_set() -> None:
+    cfg = Config.from_env({**VALID_BASE, "MCP_BEARER_TOKEN": "z" * 32})
+    assert cfg.mcp_bearer_token == "z" * 32
+
+
+def test_bearer_token_too_short_rejected() -> None:
+    """Bearer is a long-lived shared secret; reject weak ones at startup
+    rather than letting an operator paste in `password123` and call it done."""
+    with pytest.raises(ConfigError, match="at least 32 characters"):
+        Config.from_env({**VALID_BASE, "MCP_BEARER_TOKEN": "short"})
+
+
+def test_bearer_token_whitespace_only_treated_as_unset() -> None:
+    cfg = Config.from_env({**VALID_BASE, "MCP_BEARER_TOKEN": "   "})
+    assert cfg.mcp_bearer_token is None

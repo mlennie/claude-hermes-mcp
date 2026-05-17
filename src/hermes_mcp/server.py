@@ -258,6 +258,7 @@ def build_app(
     provider = StaticClientProvider(
         client_id=config.oauth_client_id,
         client_secret=config.oauth_client_secret,
+        bearer_token=config.mcp_bearer_token,
         allowed_redirect_schemes=frozenset(config.allowed_redirect_schemes),
     )
 

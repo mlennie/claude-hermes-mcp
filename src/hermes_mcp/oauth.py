@@ -6,11 +6,23 @@ an OAuth 2.1 authorization server in front of the MCP endpoint. For a
 personal bridge there is exactly one client and exactly one user, so this
 provider:
 
-  - holds a single static (client_id, client_secret) pair, configured via env
-  - auto-approves the /authorize step (security rests on the client_secret
-    + PKCE binding at the /token exchange, not on a UI consent step)
+  - holds a single static `client_id`, configured via env
+  - registers the client as a **public client** with
+    `token_endpoint_auth_method="none"` (no `client_secret`). PKCE is
+    mandatory; the SDK enforces it on every authorization-code exchange
+    (`mcp/server/auth/handlers/token.py:174-185`). Without PKCE the request
+    is rejected with `invalid_grant`, so the dynamic per-exchange
+    `code_verifier` is what actually protects token issuance.
+  - auto-approves the /authorize step
   - mints opaque random access and refresh tokens, stored in memory
   - has no persistence: tokens evaporate on restart, the client just re-auths
+
+`OAUTH_CLIENT_SECRET` is still required at startup for backward
+compatibility (Claude Desktop / Claude.ai have it pasted in their connector
+UI and will keep sending it). The server simply ignores the value at the
+/token exchange — PKCE is the real gate. Codex CLI and Cursor, which only
+support PKCE-style public clients (`McpServerOAuthConfig` has no
+`client_secret` field), now work without changes.
 
 Dynamic Client Registration is intentionally disabled. Anyone hitting
 /register is told it is unsupported.
@@ -82,9 +94,9 @@ def _check_redirect_uri(redirect_uri: AnyUrl, allowed_schemes: frozenset[str]) -
 
     Permissive within sane bounds — we do not pin specific callback URIs
     because they are subject to change without notice across client
-    versions. PKCE + `client_secret` protect the actual token exchange;
-    this scheme check just prevents `javascript:` / `data:` / `file:`
-    style open-redirector abuse.
+    versions. PKCE protects the actual token exchange (mandatory
+    code_verifier check at /token); this scheme check just prevents
+    `javascript:` / `data:` / `file:` style open-redirector abuse.
     """
     scheme = (redirect_uri.scheme or "").lower()
     if scheme not in allowed_schemes:
@@ -108,10 +120,10 @@ class _StaticClient(OAuthClientInformationFull):
     subject to a scheme allowlist enforced by `_check_redirect_uri`.
 
     Validating the redirect_uri against a *pre-registered list* is not
-    useful here: we have one client whose `client_secret` is required at
-    /token, and we have PKCE binding the code to the original
-    code_challenge. An attacker who substitutes a redirect_uri cannot
-    exchange the code without both secrets.
+    useful here: PKCE binds the authorization code to the original
+    code_challenge, so an attacker who substitutes a redirect_uri cannot
+    exchange the code without the matching code_verifier (which never
+    leaves the legitimate client).
 
     Validating the redirect_uri's *scheme* is, however, useful: without it
     `/authorize` would happily redirect to `javascript:` or `data:` URIs
@@ -138,15 +150,28 @@ class _StaticClient(OAuthClientInformationFull):
 class StaticClientProvider(
     OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]
 ):
-    """In-memory OAuth provider for a single pre-shared client."""
+    """In-memory OAuth provider for a single pre-shared client.
+
+    Optionally also accepts a static `bearer_token` as an alternative auth
+    method, for MCP clients (Codex desktop's custom-MCP form, Cursor's
+    `headers` block) whose UI has no OAuth flow at all. Both auth paths
+    coexist: each /mcp request is checked against (a) OAuth-issued access
+    tokens, then (b) the configured bearer token. Constant-time comparison
+    via `hmac.compare_digest`.
+    """
 
     client_id: str
     client_secret: str
+    bearer_token: str | None = None
     allowed_redirect_schemes: frozenset[str] = DEFAULT_ALLOWED_REDIRECT_SCHEMES
     access_token_ttl: int = DEFAULT_ACCESS_TOKEN_TTL
     refresh_token_ttl: int = DEFAULT_REFRESH_TOKEN_TTL
 
     def __post_init__(self) -> None:
+        # `self.client_secret` is kept required at construction time for
+        # backward-compat with deployments that already have OAUTH_CLIENT_SECRET
+        # set, and because Claude Desktop's UI still requires a value to paste.
+        # It is NOT used for auth — see the module docstring; PKCE is the gate.
         if not self.client_id or not self.client_secret:
             raise ValueError("client_id and client_secret are required")
         # Baseline (`https`, `http`-on-localhost) is always allowed alongside
@@ -154,13 +179,19 @@ class StaticClientProvider(
         effective_schemes = _BASELINE_SCHEMES | frozenset(
             s.lower() for s in self.allowed_redirect_schemes
         )
+        # Public client (PKCE-only). `client_secret=None` + auth method `"none"`
+        # makes the SDK skip the secret check at /token (`client_auth.py:93-104`),
+        # while PKCE remains mandatory (`token.py:26, 174-185`). This is what
+        # lets Codex CLI / Cursor — which only ship `client_id` in their MCP
+        # config — complete the OAuth flow. Claude Desktop still pastes a
+        # client_secret in its UI; the server reads it but doesn't enforce it.
         self._client = _StaticClient(
             client_id=self.client_id,
-            client_secret=self.client_secret,
+            client_secret=None,
             redirect_uris=[AnyUrl("http://localhost/")],  # placeholder; we override validation
             grant_types=["authorization_code", "refresh_token"],
             response_types=["code"],
-            token_endpoint_auth_method="client_secret_post",  # noqa: S106 — RFC 6749 method name, not a secret
+            token_endpoint_auth_method="none",  # noqa: S106 — RFC 7591 method name, not a secret
         )
         # PrivateAttr can't be set via constructor in Pydantic v2; assign here.
         self._client._allowed_redirect_schemes = effective_schemes
@@ -168,6 +199,14 @@ class StaticClientProvider(
         self._access_tokens: dict[str, AccessToken] = {}
         self._refresh_tokens: dict[str, RefreshToken] = {}
         self._refresh_to_access: dict[str, str] = {}
+        # Synthetic AccessToken returned on bearer-token auth. Lazily built
+        # the first time the bearer is presented and cached so we're not
+        # re-allocating per request. No expiry — bearer tokens are
+        # operator-rotated, not time-rotated.
+        self._bearer_access_token: AccessToken | None = None
+        # One-time audit log marker so the first bearer-auth event surfaces
+        # at INFO without spamming every subsequent request.
+        self._bearer_logged: bool = False
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         if hmac.compare_digest(client_id.encode(), self.client_id.encode()):
@@ -177,7 +216,9 @@ class StaticClientProvider(
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         raise NotImplementedError(
             "Dynamic client registration is disabled. Configure OAUTH_CLIENT_ID "
-            "and OAUTH_CLIENT_SECRET on the server and paste them into your client."
+            "on the server and paste it into your MCP client's OAuth config. "
+            "Claude Desktop also requires OAUTH_CLIENT_SECRET in its connector UI "
+            "(the server accepts but does not enforce it; PKCE is the real gate)."
         )
 
     async def authorize(
@@ -255,13 +296,31 @@ class StaticClientProvider(
         return self._mint_token_pair(client, scopes or refresh_token.scopes, None)
 
     async def load_access_token(self, token: str) -> AccessToken | None:
+        # Static bearer-token path: for clients with no OAuth UI. Compared
+        # in constant time. We check OAuth-issued tokens FIRST so that the
+        # bearer comparison only runs on a miss — minor optimization, but
+        # also keeps the OAuth path's behavior identical when no bearer is
+        # configured.
         at = self._access_tokens.get(token)
-        if at is None:
-            return None
-        if at.expires_at and at.expires_at < int(time.time()):
-            self._access_tokens.pop(token, None)
-            return None
-        return at
+        if at is not None:
+            if at.expires_at and at.expires_at < int(time.time()):
+                self._access_tokens.pop(token, None)
+                return None
+            return at
+        if self.bearer_token and hmac.compare_digest(token.encode(), self.bearer_token.encode()):
+            if not self._bearer_logged:
+                logger.info("oauth: static bearer token accepted (first use this process)")
+                self._bearer_logged = True
+            if self._bearer_access_token is None:
+                self._bearer_access_token = AccessToken(
+                    token=token,
+                    client_id=self.client_id,
+                    scopes=[],
+                    expires_at=None,
+                    resource=None,
+                )
+            return self._bearer_access_token
+        return None
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         # Revocation endpoint is not exposed; FastMCP only calls this if
@@ -338,3 +397,9 @@ def mint_client_credentials() -> tuple[str, str]:
         f"hermes-mcp-{secrets.token_urlsafe(8)}",
         secrets.token_urlsafe(32),
     )
+
+
+def mint_bearer_token() -> str:
+    """Generate a fresh static bearer token (256 bits of entropy) for MCP
+    clients whose UI has no OAuth flow (Codex desktop, Cursor headers)."""
+    return secrets.token_urlsafe(32)

@@ -43,6 +43,12 @@ class Config:
     bind_port: int
     allowed_hosts: tuple[str, ...]
     allowed_redirect_schemes: tuple[str, ...]
+    # Optional static bearer token. When set, the server accepts
+    # `Authorization: Bearer <token>` directly, in addition to OAuth-issued
+    # access tokens. Necessary for MCP clients whose UI only exposes static
+    # token fields (Codex desktop's custom-MCP form, Cursor's `headers`
+    # config) and have no OAuth flow.
+    mcp_bearer_token: str | None
     log_level: LogLevel
 
     @classmethod
@@ -120,6 +126,24 @@ class Config:
         parsed = tuple(s.strip().lower() for s in schemes_raw.split(",") if s.strip())
         allowed_redirect_schemes = parsed or DEFAULT_OAUTH_ALLOWED_REDIRECT_SCHEMES
 
+        # Static bearer token (optional). Coexists with OAuth: both auth
+        # methods are accepted at /mcp. Mostly useful for clients that have
+        # no OAuth flow in their UI (Codex desktop's custom-MCP form, Cursor's
+        # `headers` block). Min 32 chars to enforce real entropy — bearer
+        # tokens are long-lived shared secrets and the only gate behind the
+        # tunnel URL, so weak ones are catastrophic.
+        bearer_token_raw = (e.get("MCP_BEARER_TOKEN") or "").strip()
+        mcp_bearer_token: str | None
+        if bearer_token_raw:
+            if len(bearer_token_raw) < 32:
+                raise ConfigError(
+                    "MCP_BEARER_TOKEN must be at least 32 characters when set "
+                    "(generate one with: hermes-mcp mint-bearer-token)"
+                )
+            mcp_bearer_token = bearer_token_raw
+        else:
+            mcp_bearer_token = None
+
         log_level_raw = (e.get("LOG_LEVEL") or "INFO").upper()
         if log_level_raw not in _VALID_LOG_LEVELS:
             raise ConfigError(
@@ -149,6 +173,7 @@ class Config:
             bind_port=port,
             allowed_hosts=allowed_hosts,
             allowed_redirect_schemes=allowed_redirect_schemes,
+            mcp_bearer_token=mcp_bearer_token,
             log_level=log_level,
         )
 
