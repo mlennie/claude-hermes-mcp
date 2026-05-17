@@ -1,6 +1,6 @@
 # hermes-mcp
 
-> An MCP server that lets **Claude Desktop** and **Claude.ai (web + mobile)** — and any other MCP client that supports static OAuth credentials — delegate tasks to a local **[Hermes Agent](https://github.com/hermes-agent/hermes-agent)** running on your own hardware. (See [Client compatibility](#client-compatibility) for the current matrix; Codex CLI and Cursor are tracked for future support pending Dynamic Client Registration.)
+> An MCP server that lets **Claude Desktop**, **Claude.ai (web + mobile)**, **OpenAI Codex desktop**, and any other MCP client (via OAuth 2.1 or static bearer token) delegate tasks to a local **[Hermes Agent](https://github.com/hermes-agent/hermes-agent)** running on your own hardware. (See [Client compatibility](#client-compatibility) for the current matrix.)
 
 Use Claude (or another supported MCP client) as your daily chat. When you ask for something Hermes is built for — scheduling cron jobs, browser automation, email, document creation, persistent skills, WhatsApp/Slack messaging — your client calls Hermes through this bridge.
 
@@ -83,38 +83,38 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 | `BIND_PORT` | no | `8765` | Port. |
 | `HERMES_REQUEST_TIMEOUT_SECONDS` | no | `300` | Max wall-clock per `hermes_ask` call. |
 | `OAUTH_ALLOWED_REDIRECT_SCHEMES` | no | `claude,claudeai,cursor` | Comma-separated OAuth redirect-URI custom schemes to accept. `https` and `http`-on-localhost always allowed. Extend to add support for new MCP clients (e.g. add `vscode` for Continue). |
+| `MCP_BEARER_TOKEN` | no | (unset) | Optional static bearer token (32+ chars). When set, the server accepts `Authorization: Bearer <token>` directly at `/mcp`, in addition to OAuth. Necessary for MCP clients whose UI has no OAuth flow (Codex desktop's custom-MCP form, Cursor's `headers` block). Generate with `hermes-mcp mint-bearer-token`. |
 | `LOG_LEVEL` | no | `INFO` | `DEBUG` enables prompt-body logging. |
 
 ## Client compatibility
 
-hermes-mcp speaks plain **Streamable HTTP + OAuth 2.1**, but the OAuth provider is configured for **static, pre-shared credentials** (single `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` pair, **DCR disabled**). A client can connect only if it supports pasting in static OAuth client credentials. The MCP ecosystem is mid-transition: some clients still support this, others have moved to Dynamic Client Registration only.
+hermes-mcp speaks plain **Streamable HTTP** and supports two auth paths so different MCP clients can connect:
+
+- **OAuth 2.1 (PKCE-only public client).** Static `OAUTH_CLIENT_ID` + auto-approve `/authorize`. PKCE is the dynamic per-exchange secret; `client_secret` is accepted in the form but no longer enforced (clients that send one still work, clients that omit it work too). DCR is disabled.
+- **Static bearer token.** Set `MCP_BEARER_TOKEN` and the server accepts `Authorization: Bearer <token>` directly at `/mcp`, bypassing OAuth entirely. Necessary for clients whose UI has no OAuth field.
+
+Pick whichever the client's UI supports — both auth paths coexist on the same server instance.
 
 ### Tested ✅
 
-| Client | How to connect |
-|---|---|
-| **Claude Desktop / Claude.ai (web + mobile)** | Settings → Connectors → Add custom connector → paste the server URL + your `OAUTH_CLIENT_ID` + your `OAUTH_CLIENT_SECRET`. |
-
-### Known incompatible (DCR-only) ❌
-
-| Client | Status | Tracking |
+| Client | Auth | How to connect |
 |---|---|---|
-| **OpenAI Codex CLI** | Empirically confirmed incompatible — `codex mcp add` / `codex mcp login` auto-attempts Dynamic Client Registration and fails with `Registration failed: Dynamic client registration not supported`. No documented way to pre-configure a static `client_id` / `client_secret`. | [Add DCR support](https://github.com/mlennie/hermes-mcp/issues) — coming in a future release. |
+| **Claude Desktop / Claude.ai (web + mobile)** | OAuth | Settings → Connectors → Add custom connector → paste the server URL + your `OAUTH_CLIENT_ID` + your `OAUTH_CLIENT_SECRET`. (The secret is accepted but no longer enforced server-side; the field is still required by Claude's UI, so set it.) |
+| **OpenAI Codex desktop** | Bearer | Settings → MCP → Connect to a custom MCP → Streamable HTTP → URL = your tunnel + `/mcp`, **Bearer token env var** = name of an OS env var on your laptop that holds your `MCP_BEARER_TOKEN` value. Restart Codex desktop after setting the env var so it's inherited. Skips OAuth entirely. |
 
-### Untested (likely DCR-only, unconfirmed)
+### Untested (likely workable via bearer)
 
-These clients use OAuth + custom URI schemes per the MCP spec convention, which strongly suggests they also rely on DCR. We haven't tested them. The scheme allowlist defaults already include their custom URI schemes, so the moment DCR support lands they'll likely work.
+These clients all support setting custom request headers, which is enough to drive the bearer-token path. We haven't tested them end-to-end yet — if you connect one, please [open an issue](https://github.com/mlennie/hermes-mcp/issues) with your config so we can promote it.
 
-| Client | Custom redirect scheme | Docs |
+| Client | Likely auth | Where to set it |
 |---|---|---|
-| **Cursor** | `cursor://anysphere.cursor-mcp/oauth/callback` (already in default allowlist) | [`~/.cursor/mcp.json`](https://docs.cursor.com/context/mcp) |
-| **Continue (VSCode)** | `vscode://` (add to `OAUTH_ALLOWED_REDIRECT_SCHEMES`) | [Continue MCP docs](https://docs.continue.dev/customize/deep-dives/mcp) |
-
-If you successfully connect one of these (or another client not listed), please [open an issue](https://github.com/mlennie/hermes-mcp/issues) — we'll promote it to "Tested" with your specific config notes.
+| **Cursor** | Bearer via `headers` | `~/.cursor/mcp.json` → `"headers": { "Authorization": "Bearer ${env:MCP_BEARER_TOKEN}" }` |
+| **Continue (VSCode)** | Bearer via `requestOptions.headers` | `continue` config: `requestOptions.headers.Authorization = "Bearer ..."` |
+| **OpenAI Codex CLI** | OAuth (PKCE) | `~/.codex/config.toml` → `[mcp_servers.hermes.oauth] client_id = "..."`. **Caveat:** Codex CLI's OAuth flow uses a localhost callback on whichever machine `codex` runs on; if you SSH from a laptop into the mini-PC where hermes-mcp lives, the laptop browser can't reach that callback. Easiest workaround is to use the desktop app (above) instead. |
 
 ### Adding a new client whose custom URI scheme isn't in the default
 
-If your client supports static OAuth credentials AND uses a redirect scheme not in the default `claude,claudeai,cursor`, add it to `OAUTH_ALLOWED_REDIRECT_SCHEMES`:
+If your client uses OAuth AND a redirect scheme not in the default `claude,claudeai,cursor`, add it to `OAUTH_ALLOWED_REDIRECT_SCHEMES`:
 
 ```bash
 export OAUTH_ALLOWED_REDIRECT_SCHEMES=claude,claudeai,cursor,vscode
